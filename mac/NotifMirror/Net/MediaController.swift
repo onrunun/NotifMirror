@@ -1,15 +1,15 @@
 import Foundation
 
-/// Holds the latest media snapshot reported by the phone and sends transport
-/// commands back. Pure glue — UI reads `AppState.shared.media`.
+/// Holds the latest media snapshot per connected phone and routes playback
+/// commands back to the phone that owns the currently displayed session.
 @MainActor
 final class MediaController {
     static let shared = MediaController()
 
     private init() {}
 
-    func handleRemoteState(_ m: WireMessage.MediaState) {
-        AppState.shared.media = MediaSnapshot(
+    func handleRemoteState(_ m: WireMessage.MediaState, from deviceId: String) {
+        let snap = MediaSnapshot(
             pkg: m.pkg,
             app: m.app,
             title: m.title,
@@ -26,20 +26,23 @@ final class MediaController {
             maxVolume: m.maxVolume,
             updatedAt: Date()
         )
+        AppState.shared.updateMedia(snap, for: deviceId)
     }
 
-    func send(cmd: String, value: Int? = nil) {
+    func send(cmd: String, value: Int? = nil, to explicitDeviceId: String? = nil) {
         guard Preferences.shared.mediaControlEnabled else { return }
-        WsServer.shared.send(.mediaCmd(cmd: cmd, value: value))
+        let target = explicitDeviceId ?? AppState.shared.mediaDevice?.id
+        WsServer.shared.send(.mediaCmd(cmd: cmd, value: value), to: target)
     }
 
-    func refresh() {
-        WsServer.shared.send(.mediaCmd(cmd: "refresh", value: nil))
+    func refresh(to explicitDeviceId: String? = nil) {
+        let target = explicitDeviceId ?? AppState.shared.mediaDevice?.id
+        WsServer.shared.send(.mediaCmd(cmd: "refresh", value: nil), to: target)
     }
 
-    /// Called when the peer disconnects — clear stale state so the UI doesn't
-    /// look like it's still playing.
-    func peerDisconnected() {
-        AppState.shared.media = .empty
+    func peerDisconnected(deviceId: String? = nil) {
+        if let deviceId {
+            AppState.shared.updateMedia(.empty, for: deviceId)
+        }
     }
 }

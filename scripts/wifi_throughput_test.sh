@@ -15,7 +15,7 @@
 # Usage:
 #   ./scripts/wifi_throughput_test.sh
 #   # or force a specific Mac IP:
-#   MAC_IP=192.168.1.103 ./scripts/wifi_throughput_test.sh
+#   MAC_IP=192.168.1.42 ./scripts/wifi_throughput_test.sh
 
 set -u
 

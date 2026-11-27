@@ -12,25 +12,37 @@
 		27B03D8354B8C3D9FD56FF55 /* ProtocolFileClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3AE25C7721450554D41ECA20 /* ProtocolFileClient.swift */; };
 		293C0BE8EF7B357A1B63938A /* WsServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = DE327A8E97EE282A89AD0429 /* WsServer.swift */; };
 		2DC90AA54BFAB700FD606FCA /* BlockedApps.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2C44EDECDF6CDE515ACBFC7 /* BlockedApps.swift */; };
+		30ABE2F56C0832AE78EDD683 /* MirroredAppsPane.swift in Sources */ = {isa = PBXBuildFile; fileRef = E44654D54E58AD1B23326D5D /* MirroredAppsPane.swift */; };
 		3559D85462F4A2F1BF189DE2 /* AdbClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = CED25865F1699AD51700ECC9 /* AdbClient.swift */; };
 		37A71B2E27A642BF888419D0 /* FileBackend.swift in Sources */ = {isa = PBXBuildFile; fileRef = 64D127E7A946DC8BDB22B52B /* FileBackend.swift */; };
 		38FDDDC0DEB84A2162D575B9 /* FileTransferCenter.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC1A78D4CD2C7958D56617D7 /* FileTransferCenter.swift */; };
 		3C3FDC3D562325FD03A6FB1A /* SelfSignedCert.swift in Sources */ = {isa = PBXBuildFile; fileRef = 418ACCDAC83704A9970D87A3 /* SelfSignedCert.swift */; };
 		4E6C15D9B4A666C3DF67D6EB /* MediaController.swift in Sources */ = {isa = PBXBuildFile; fileRef = CF6C7AB29EA08C2B09287017 /* MediaController.swift */; };
 		518C7EA4073FBE5459D673C5 /* Protocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = 302581CB8ABBF0A7904C074E /* Protocol.swift */; };
+		5200B3C5B3524305B4E01559 /* FilesModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3DDF1C37FF9857C463C42AB5 /* FilesModel.swift */; };
 		5DC867B423E3E4E6116E7D83 /* PairingPayloadTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E9C53478233F3717A784C76 /* PairingPayloadTests.swift */; };
+		61F41B1BB32B0A0D132B5D0A /* OverviewPane.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB65C3805A68FAC602BFC9B2 /* OverviewPane.swift */; };
+		7C16D51A33C51D78BC764D23 /* NotificationsPane.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2C6D5F125B470CAEE92FC89E /* NotificationsPane.swift */; };
 		8245D55E6F506F60394F4B17 /* QRCodeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 46C5E8F12DA50EF114BE4FCF /* QRCodeView.swift */; };
 		8FD8AF055F900D1F4FDC13F2 /* MainWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE72CEA841E4F972F66E0529 /* MainWindow.swift */; };
 		94247732DBDA966318710447 /* DelegateHandler.swift in Sources */ = {isa = PBXBuildFile; fileRef = D85B61ED896A28F636972813 /* DelegateHandler.swift */; };
+		952A3AA8ED2E1DC3F27995B7 /* BulkTransferServerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 201226B23FEF6864812B4B19 /* BulkTransferServerTests.swift */; };
 		A5D9BD0FE48A5E58A496B860 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 89FEEF837ACA909E37C49E29 /* Assets.xcassets */; };
 		A9BCB467D14621F35319A67F /* AppState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 253918F65FDFC9D7E09B2112 /* AppState.swift */; };
 		AC7D8CAFA7D52C319FECEAEF /* WireCodecTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 995E4C51BC2C2010DC1264C5 /* WireCodecTests.swift */; };
+		ACAEDBBA0BB6C672BCB9D5B0 /* CodeExtractor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 570CD46C711ED0AFB0A223A5 /* CodeExtractor.swift */; };
+		ADBB37BB7F36F871AD4F78E9 /* SettingsPane.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA0E402A90A84E81D2BCEE79 /* SettingsPane.swift */; };
+		AE41D631111DB14633FC4CB5 /* FilesGridView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D8DB354DD4E367146251EBA /* FilesGridView.swift */; };
+		AE776BDDC41E26291F3F0AF2 /* FileTransferSanitizationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 870BD3A51E8F77B0F3FFA8E0 /* FileTransferSanitizationTests.swift */; };
 		B01FF261693CB2D149DB0121 /* NotifMirrorApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6B732A15CF1195C6D8300923 /* NotifMirrorApp.swift */; };
+		C5BCB953F6AB166CECD51C94 /* BulkTransferServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5F1FF36CE8B8BF203FCA57C /* BulkTransferServer.swift */; };
 		C876A9FC2B51BF6F852F783B /* NotificationHistory.swift in Sources */ = {isa = PBXBuildFile; fileRef = B46A78610403F425FF019A4D /* NotificationHistory.swift */; };
 		CCE892BDFEFD39F13957180C /* ScreenMirror.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1988D0BFDB986D3FECF0ED05 /* ScreenMirror.swift */; };
 		D6402F191E715E45AC022552 /* Pairing.swift in Sources */ = {isa = PBXBuildFile; fileRef = E396095A83D39C96754B9DD9 /* Pairing.swift */; };
+		D807422793394401BC0B43C2 /* TransfersPane.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0393DCCBF0A104D7FF57A75 /* TransfersPane.swift */; };
 		DA94CEDD2051B0AD18F42610 /* NotificationCenter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 980507D0F2F64E9FF9D56538 /* NotificationCenter.swift */; };
 		DB7573660F11EE62AF98B76B /* BatteryStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 790666888BE72C611CF94BB8 /* BatteryStore.swift */; };
+		DC307D12E9C3975FD30C736E /* SharedComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1ECCCC469EE7BCF1FCD21697 /* SharedComponents.swift */; };
 		DC3B6A24235441DD40593769 /* CategoryRegistry.swift in Sources */ = {isa = PBXBuildFile; fileRef = EFC9405C8F4BB09AC8E3A9D0 /* CategoryRegistry.swift */; };
 		DCD67BB80242A248BDCAED0D /* MenuContent.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6A17D0AC776BC85A338ED996 /* MenuContent.swift */; };
 		E51CBC6A99D5BE9176261DB4 /* FilesPane.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2DDC1C3CBD27CDEBD075B217 /* FilesPane.swift */; };
@@ -51,13 +63,18 @@
 
 /* Begin PBXFileReference section */
 		1988D0BFDB986D3FECF0ED05 /* ScreenMirror.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenMirror.swift; sourceTree = "<group>"; };
+		1ECCCC469EE7BCF1FCD21697 /* SharedComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SharedComponents.swift; sourceTree = "<group>"; };
+		201226B23FEF6864812B4B19 /* BulkTransferServerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BulkTransferServerTests.swift; sourceTree = "<group>"; };
 		253918F65FDFC9D7E09B2112 /* AppState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppState.swift; sourceTree = "<group>"; };
+		2C6D5F125B470CAEE92FC89E /* NotificationsPane.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationsPane.swift; sourceTree = "<group>"; };
 		2DDC1C3CBD27CDEBD075B217 /* FilesPane.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilesPane.swift; sourceTree = "<group>"; };
 		2EEFF1AAB18D720E42F582FA /* StorageAnalyzerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StorageAnalyzerView.swift; sourceTree = "<group>"; };
 		302581CB8ABBF0A7904C074E /* Protocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Protocol.swift; sourceTree = "<group>"; };
 		3AE25C7721450554D41ECA20 /* ProtocolFileClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProtocolFileClient.swift; sourceTree = "<group>"; };
+		3DDF1C37FF9857C463C42AB5 /* FilesModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilesModel.swift; sourceTree = "<group>"; };
 		418ACCDAC83704A9970D87A3 /* SelfSignedCert.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SelfSignedCert.swift; sourceTree = "<group>"; };
 		46C5E8F12DA50EF114BE4FCF /* QRCodeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QRCodeView.swift; sourceTree = "<group>"; };
+		570CD46C711ED0AFB0A223A5 /* CodeExtractor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodeExtractor.swift; sourceTree = "<group>"; };
 		5E9C53478233F3717A784C76 /* PairingPayloadTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PairingPayloadTests.swift; sourceTree = "<group>"; };
 		63F820303980C37B39FC93D6 /* Preferences.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Preferences.swift; sourceTree = "<group>"; };
 		64D127E7A946DC8BDB22B52B /* FileBackend.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileBackend.swift; sourceTree = "<group>"; };
@@ -65,20 +82,27 @@
 		6B732A15CF1195C6D8300923 /* NotifMirrorApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotifMirrorApp.swift; sourceTree = "<group>"; };
 		790666888BE72C611CF94BB8 /* BatteryStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BatteryStore.swift; sourceTree = "<group>"; };
 		7D407983F11E241E84D4DFC0 /* NotifMirrorTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = NotifMirrorTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		7D8DB354DD4E367146251EBA /* FilesGridView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilesGridView.swift; sourceTree = "<group>"; };
+		870BD3A51E8F77B0F3FFA8E0 /* FileTransferSanitizationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileTransferSanitizationTests.swift; sourceTree = "<group>"; };
 		89FEEF837ACA909E37C49E29 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		8C34A6FE2D6384ADD4F52768 /* AppIconCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppIconCache.swift; sourceTree = "<group>"; };
 		92E0A872AE4CE571C6321171 /* AttachmentWriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AttachmentWriter.swift; sourceTree = "<group>"; };
 		980507D0F2F64E9FF9D56538 /* NotificationCenter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationCenter.swift; sourceTree = "<group>"; };
 		995E4C51BC2C2010DC1264C5 /* WireCodecTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WireCodecTests.swift; sourceTree = "<group>"; };
+		A0393DCCBF0A104D7FF57A75 /* TransfersPane.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TransfersPane.swift; sourceTree = "<group>"; };
+		AB65C3805A68FAC602BFC9B2 /* OverviewPane.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OverviewPane.swift; sourceTree = "<group>"; };
 		B46A78610403F425FF019A4D /* NotificationHistory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationHistory.swift; sourceTree = "<group>"; };
+		BA0E402A90A84E81D2BCEE79 /* SettingsPane.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsPane.swift; sourceTree = "<group>"; };
 		BC1A78D4CD2C7958D56617D7 /* FileTransferCenter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileTransferCenter.swift; sourceTree = "<group>"; };
 		C15E810C9B8EE990713FA5FB /* ClipboardSync.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClipboardSync.swift; sourceTree = "<group>"; };
 		CED25865F1699AD51700ECC9 /* AdbClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AdbClient.swift; sourceTree = "<group>"; };
 		CF6C7AB29EA08C2B09287017 /* MediaController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaController.swift; sourceTree = "<group>"; };
+		D5F1FF36CE8B8BF203FCA57C /* BulkTransferServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BulkTransferServer.swift; sourceTree = "<group>"; };
 		D6A9B5B478A09537E4AE7712 /* NotifMirror.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = NotifMirror.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		D85B61ED896A28F636972813 /* DelegateHandler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DelegateHandler.swift; sourceTree = "<group>"; };
 		DE327A8E97EE282A89AD0429 /* WsServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WsServer.swift; sourceTree = "<group>"; };
 		E396095A83D39C96754B9DD9 /* Pairing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Pairing.swift; sourceTree = "<group>"; };
+		E44654D54E58AD1B23326D5D /* MirroredAppsPane.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MirroredAppsPane.swift; sourceTree = "<group>"; };
 		EE72CEA841E4F972F66E0529 /* MainWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainWindow.swift; sourceTree = "<group>"; };
 		EFC9405C8F4BB09AC8E3A9D0 /* CategoryRegistry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CategoryRegistry.swift; sourceTree = "<group>"; };
 		F2C44EDECDF6CDE515ACBFC7 /* BlockedApps.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BlockedApps.swift; sourceTree = "<group>"; };
@@ -99,6 +123,7 @@
 			children = (
 				92E0A872AE4CE571C6321171 /* AttachmentWriter.swift */,
 				EFC9405C8F4BB09AC8E3A9D0 /* CategoryRegistry.swift */,
+				570CD46C711ED0AFB0A223A5 /* CodeExtractor.swift */,
 				D85B61ED896A28F636972813 /* DelegateHandler.swift */,
 				980507D0F2F64E9FF9D56538 /* NotificationCenter.swift */,
 			);
@@ -121,6 +146,7 @@
 			children = (
 				CED25865F1699AD51700ECC9 /* AdbClient.swift */,
 				790666888BE72C611CF94BB8 /* BatteryStore.swift */,
+				D5F1FF36CE8B8BF203FCA57C /* BulkTransferServer.swift */,
 				C15E810C9B8EE990713FA5FB /* ClipboardSync.swift */,
 				64D127E7A946DC8BDB22B52B /* FileBackend.swift */,
 				BC1A78D4CD2C7958D56617D7 /* FileTransferCenter.swift */,
@@ -138,11 +164,19 @@
 		7C65C7DBD1F84BF232C4FE08 /* UI */ = {
 			isa = PBXGroup;
 			children = (
+				7D8DB354DD4E367146251EBA /* FilesGridView.swift */,
+				3DDF1C37FF9857C463C42AB5 /* FilesModel.swift */,
 				2DDC1C3CBD27CDEBD075B217 /* FilesPane.swift */,
 				EE72CEA841E4F972F66E0529 /* MainWindow.swift */,
 				6A17D0AC776BC85A338ED996 /* MenuContent.swift */,
+				E44654D54E58AD1B23326D5D /* MirroredAppsPane.swift */,
+				2C6D5F125B470CAEE92FC89E /* NotificationsPane.swift */,
+				AB65C3805A68FAC602BFC9B2 /* OverviewPane.swift */,
 				46C5E8F12DA50EF114BE4FCF /* QRCodeView.swift */,
+				BA0E402A90A84E81D2BCEE79 /* SettingsPane.swift */,
+				1ECCCC469EE7BCF1FCD21697 /* SharedComponents.swift */,
 				2EEFF1AAB18D720E42F582FA /* StorageAnalyzerView.swift */,
+				A0393DCCBF0A104D7FF57A75 /* TransfersPane.swift */,
 			);
 			path = UI;
 			sourceTree = "<group>";
@@ -172,6 +206,8 @@
 		DCF27C05BB4718126A13A9DB /* NotifMirrorTests */ = {
 			isa = PBXGroup;
 			children = (
+				201226B23FEF6864812B4B19 /* BulkTransferServerTests.swift */,
+				870BD3A51E8F77B0F3FFA8E0 /* FileTransferSanitizationTests.swift */,
 				5E9C53478233F3717A784C76 /* PairingPayloadTests.swift */,
 				995E4C51BC2C2010DC1264C5 /* WireCodecTests.swift */,
 			);
@@ -287,18 +323,25 @@
 				FADF51BAE75BA559BBD8A156 /* AttachmentWriter.swift in Sources */,
 				DB7573660F11EE62AF98B76B /* BatteryStore.swift in Sources */,
 				2DC90AA54BFAB700FD606FCA /* BlockedApps.swift in Sources */,
+				C5BCB953F6AB166CECD51C94 /* BulkTransferServer.swift in Sources */,
 				DC3B6A24235441DD40593769 /* CategoryRegistry.swift in Sources */,
 				F7E84FBBA2AC142C15027B84 /* ClipboardSync.swift in Sources */,
+				ACAEDBBA0BB6C672BCB9D5B0 /* CodeExtractor.swift in Sources */,
 				94247732DBDA966318710447 /* DelegateHandler.swift in Sources */,
 				37A71B2E27A642BF888419D0 /* FileBackend.swift in Sources */,
 				38FDDDC0DEB84A2162D575B9 /* FileTransferCenter.swift in Sources */,
+				AE41D631111DB14633FC4CB5 /* FilesGridView.swift in Sources */,
+				5200B3C5B3524305B4E01559 /* FilesModel.swift in Sources */,
 				E51CBC6A99D5BE9176261DB4 /* FilesPane.swift in Sources */,
 				8FD8AF055F900D1F4FDC13F2 /* MainWindow.swift in Sources */,
 				4E6C15D9B4A666C3DF67D6EB /* MediaController.swift in Sources */,
 				DCD67BB80242A248BDCAED0D /* MenuContent.swift in Sources */,
+				30ABE2F56C0832AE78EDD683 /* MirroredAppsPane.swift in Sources */,
 				B01FF261693CB2D149DB0121 /* NotifMirrorApp.swift in Sources */,
 				DA94CEDD2051B0AD18F42610 /* NotificationCenter.swift in Sources */,
 				C876A9FC2B51BF6F852F783B /* NotificationHistory.swift in Sources */,
+				7C16D51A33C51D78BC764D23 /* NotificationsPane.swift in Sources */,
+				61F41B1BB32B0A0D132B5D0A /* OverviewPane.swift in Sources */,
 				D6402F191E715E45AC022552 /* Pairing.swift in Sources */,
 				0FD8EC1057FE4A8F0DBEDB03 /* Preferences.swift in Sources */,
 				518C7EA4073FBE5459D673C5 /* Protocol.swift in Sources */,
@@ -306,7 +349,10 @@
 				8245D55E6F506F60394F4B17 /* QRCodeView.swift in Sources */,
 				CCE892BDFEFD39F13957180C /* ScreenMirror.swift in Sources */,
 				3C3FDC3D562325FD03A6FB1A /* SelfSignedCert.swift in Sources */,
+				ADBB37BB7F36F871AD4F78E9 /* SettingsPane.swift in Sources */,
+				DC307D12E9C3975FD30C736E /* SharedComponents.swift in Sources */,
 				E69C69874D7E0D00943B3F2C /* StorageAnalyzerView.swift in Sources */,
+				D807422793394401BC0B43C2 /* TransfersPane.swift in Sources */,
 				293C0BE8EF7B357A1B63938A /* WsServer.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -315,6 +361,8 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				952A3AA8ED2E1DC3F27995B7 /* BulkTransferServerTests.swift in Sources */,
+				AE776BDDC41E26291F3F0AF2 /* FileTransferSanitizationTests.swift in Sources */,
 				5DC867B423E3E4E6116E7D83 /* PairingPayloadTests.swift in Sources */,
 				AC7D8CAFA7D52C319FECEAEF /* WireCodecTests.swift in Sources */,
 			);

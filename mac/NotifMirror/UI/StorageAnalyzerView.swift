@@ -13,13 +13,12 @@ final class StorageAnalyzerModel: ObservableObject {
     @Published var errorMessage: String? = nil
     @Published var lastScanDuration: TimeInterval = 0
 
-    /// Snapshot of the backend at sheet-open time. We don't follow the
-    /// FilesModel's `backend` mid-scan because flipping Wi-Fi ↔ adb while a
-    /// `du` is in flight would just produce a confused result.
     let backend: FileBackend
     let backendKind: BackendKind
 
-    enum BackendKind { case wifi, adb
+    enum BackendKind {
+        case wifi, adb
+
         var label: String {
             switch self {
             case .wifi: return "Wi-Fi"
@@ -28,9 +27,8 @@ final class StorageAnalyzerModel: ObservableObject {
         }
     }
 
-    /// Path stack for back navigation. Always contains at least `rootPath`
-    /// at index 0; `currentPath` matches `stack.last`.
     private var stack: [String] = []
+    private var scanTask: Task<Void, Never>? = nil
 
     init(rootPath: String, backend: FileBackend, backendKind: BackendKind) {
         self.rootPath = rootPath
@@ -52,6 +50,20 @@ final class StorageAnalyzerModel: ObservableObject {
         return acc
     }
 
+    func startScan() {
+        scanTask?.cancel()
+        scanTask = Task { await scan() }
+    }
+
+    func cancelScan() {
+        scanTask?.cancel()
+        scanTask = nil
+        isScanning = false
+        if entries.isEmpty {
+            errorMessage = "Scan cancelled."
+        }
+    }
+
     func scan() async {
         isScanning = true
         errorMessage = nil
@@ -60,11 +72,13 @@ final class StorageAnalyzerModel: ObservableObject {
         let requested = currentPath
         do {
             let report = try await backend.diskAnalyze(path: requested)
-            // Guard against navigating away mid-scan.
+            try Task.checkCancellation()
             guard requested == currentPath else { return }
             self.totalSize = report.totalSize
             self.entries = report.entries.sorted { $0.totalSize > $1.totalSize }
             self.lastScanDuration = Date().timeIntervalSince(start)
+        } catch is CancellationError {
+            return
         } catch {
             guard requested == currentPath else { return }
             self.entries = []
@@ -78,41 +92,35 @@ final class StorageAnalyzerModel: ObservableObject {
         let next = joined(currentPath, entry.name)
         stack.append(next)
         currentPath = next
-        Task { await scan() }
+        startScan()
     }
 
     func goBack() {
         guard canGoBack else { return }
         stack.removeLast()
         currentPath = stack.last!
-        Task { await scan() }
+        startScan()
     }
 
     func goTo(_ path: String) {
         guard path != currentPath else { return }
-        // Treat any breadcrumb hop as a fresh stack root from `rootPath`'s
-        // perspective: keep root at index 0, then path. Avoids surprising
-        // back behaviour after a few drill-downs and a breadcrumb jump.
         stack = [rootPath, path].uniqueInOrder()
         currentPath = path
-        Task { await scan() }
+        startScan()
     }
 
     func delete(_ entry: WireMessage.FsDuEntry) async {
         let target = joined(currentPath, entry.name)
         do {
             try await backend.delete(path: target)
-            // Rescan so the bars and totals reflect the deletion.
             await scan()
         } catch {
             self.errorMessage = (error as? LocalizedError)?.errorDescription ?? "\(error)"
         }
     }
 
-    /// Used by "Reveal in Files" — caller closes the sheet and points the
-    /// FilesModel at `revealParent` with `revealName` highlighted.
     func revealInfo(for entry: WireMessage.FsDuEntry) -> (parent: String, name: String) {
-        return (currentPath, entry.name)
+        (currentPath, entry.name)
     }
 
     private func joined(_ base: String, _ name: String) -> String {
@@ -133,9 +141,8 @@ private extension Array where Element: Equatable {
 struct StorageAnalyzerView: View {
     @StateObject private var model: StorageAnalyzerModel
     @Environment(\.dismiss) private var dismiss
+    @State private var selectedId: WireMessage.FsDuEntry.ID? = nil
 
-    /// Closure handed in by FilesPane so "Reveal in Files" can navigate the
-    /// underlying browser without us reaching into FilesModel directly.
     var onReveal: (_ parent: String, _ name: String) -> Void
 
     init(
@@ -150,6 +157,11 @@ struct StorageAnalyzerView: View {
         self.onReveal = onReveal
     }
 
+    private var selectedEntry: WireMessage.FsDuEntry? {
+        guard let selectedId else { return nil }
+        return model.entries.first { $0.id == selectedId }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             header
@@ -160,7 +172,9 @@ struct StorageAnalyzerView: View {
             footer
         }
         .frame(minWidth: 640, idealWidth: 760, minHeight: 460, idealHeight: 560)
-        .task { await model.scan() }
+        .onAppear { model.startScan() }
+        .onDisappear { model.cancelScan() }
+        .background(keyboardShortcuts)
     }
 
     // MARK: Header
@@ -170,14 +184,13 @@ struct StorageAnalyzerView: View {
             HStack {
                 Image(systemName: "chart.pie.fill")
                     .foregroundStyle(.tint)
+                    .accessibilityHidden(true)
                 Text("Storage")
                     .font(.title2.weight(.semibold))
                 Text(model.backendKind.label)
                     .font(.caption.weight(.medium))
                     .padding(.horizontal, 6).padding(.vertical, 2)
-                    .background(
-                        Capsule().fill(Color.secondary.opacity(0.15))
-                    )
+                    .background(Capsule().fill(Color.secondary.opacity(0.15)))
                     .foregroundStyle(.secondary)
                 Spacer()
                 Button { dismiss() } label: {
@@ -186,7 +199,8 @@ struct StorageAnalyzerView: View {
                         .foregroundStyle(.tertiary)
                 }
                 .buttonStyle(.plain)
-                .help("Close")
+                .help("Close (Esc)")
+                .accessibilityLabel("Close storage analyzer")
                 .keyboardShortcut(.escape, modifiers: [])
             }
 
@@ -197,13 +211,15 @@ struct StorageAnalyzerView: View {
                 .buttonStyle(.borderless)
                 .disabled(!model.canGoBack)
                 .help("Back")
+                .accessibilityLabel("Back")
 
-                Button { Task { await model.scan() } } label: {
+                Button { model.startScan() } label: {
                     Image(systemName: "arrow.clockwise")
                 }
                 .buttonStyle(.borderless)
                 .disabled(model.isScanning)
                 .help("Rescan")
+                .accessibilityLabel("Rescan folder")
 
                 breadcrumb
             }
@@ -221,6 +237,7 @@ struct StorageAnalyzerView: View {
                         Image(systemName: "chevron.right")
                             .font(.caption2)
                             .foregroundStyle(.tertiary)
+                            .accessibilityHidden(true)
                     }
                     Button {
                         model.goTo(part.path)
@@ -245,6 +262,9 @@ struct StorageAnalyzerView: View {
                     .font(.callout).foregroundStyle(.secondary)
                 Text("Large folders can take 10–30 seconds.")
                     .font(.caption).foregroundStyle(.tertiary)
+                Button("Cancel scan") { model.cancelScan() }
+                    .buttonStyle(.bordered)
+                    .padding(.top, 4)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if let err = model.errorMessage, model.entries.isEmpty {
@@ -252,11 +272,12 @@ struct StorageAnalyzerView: View {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .font(.system(size: 28))
                     .foregroundStyle(.orange)
+                    .accessibilityHidden(true)
                 Text(err)
                     .multilineTextAlignment(.center)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: 420)
-                Button("Retry") { Task { await model.scan() } }
+                Button("Retry") { model.startScan() }
                     .buttonStyle(.bordered)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -273,25 +294,47 @@ struct StorageAnalyzerView: View {
 
     private var entryList: some View {
         let maxBytes = max(1, model.entries.first?.totalSize ?? 1)
-        return ScrollView {
-            LazyVStack(alignment: .leading, spacing: 0) {
-                ForEach(model.entries) { entry in
-                    StorageRow(
-                        entry: entry,
-                        maxBytes: maxBytes,
-                        totalBytes: model.totalSize,
-                        onOpen: { model.enter(entry) },
-                        onReveal: {
-                            let info = model.revealInfo(for: entry)
-                            onReveal(info.parent, info.name)
-                            dismiss()
-                        },
-                        onDelete: { confirmDelete(entry) }
-                    )
-                    Divider().padding(.leading, 44)
+        return List(model.entries, selection: $selectedId) { entry in
+            StorageRow(
+                entry: entry,
+                maxBytes: maxBytes,
+                totalBytes: model.totalSize,
+                onOpen: { model.enter(entry) },
+                onReveal: {
+                    let info = model.revealInfo(for: entry)
+                    onReveal(info.parent, info.name)
+                    dismiss()
+                },
+                onDelete: { confirmDelete(entry) }
+            )
+            .tag(entry.id)
+            .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
+        }
+        .listStyle(.plain)
+    }
+
+    @ViewBuilder
+    private var keyboardShortcuts: some View {
+        ZStack {
+            Button("") {
+                if let entry = selectedEntry, entry.kind == .dir {
+                    model.enter(entry)
                 }
             }
+            .keyboardShortcut(.return, modifiers: [])
+            .disabled(selectedEntry?.kind != .dir)
+
+            Button("") {
+                if let entry = selectedEntry {
+                    confirmDelete(entry)
+                }
+            }
+            .keyboardShortcut(.delete, modifiers: .command)
+            .disabled(selectedEntry == nil)
         }
+        .opacity(0)
+        .frame(width: 0, height: 0)
+        .allowsHitTesting(false)
     }
 
     // MARK: Footer
@@ -301,14 +344,20 @@ struct StorageAnalyzerView: View {
             if model.isScanning && !model.entries.isEmpty {
                 ProgressView().controlSize(.small)
                 Text("Rescanning…").font(.caption).foregroundStyle(.secondary)
+                Button("Cancel") { model.cancelScan() }
+                    .buttonStyle(.borderless)
+                    .font(.caption)
             } else {
                 Text(summaryString)
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
             Spacer()
+            Text("Return to open folder • ⌘⌫ to delete")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
             if model.lastScanDuration > 0 {
-                Text(String(format: "Scanned in %.1fs", model.lastScanDuration))
+                Text(String(format: "· %.1fs", model.lastScanDuration))
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.tertiary)
             }
@@ -322,7 +371,7 @@ struct StorageAnalyzerView: View {
         let count = model.entries.count
         let base = "\(total) across \(count) item\(count == 1 ? "" : "s")"
         let files = model.entries.reduce(0) { $0 + $1.fileCount }
-        guard files > 0 else { return base }   // adb mode doesn't report file counts
+        guard files > 0 else { return base }
         return "\(base) · \(files) file\(files == 1 ? "" : "s")"
     }
 
@@ -361,18 +410,17 @@ private struct StorageRow: View {
             Image(systemName: iconName)
                 .foregroundStyle(iconColor)
                 .frame(width: 22)
+                .accessibilityHidden(true)
 
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
                     Text(entry.name)
                         .lineLimit(1)
                     if entry.kind == .dir, entry.fileCount > 0 {
-                        // adb mode reports fileCount=0 because `du` doesn't
-                        // give it cheaply — hide the badge instead of lying.
                         Text("·")
                             .foregroundStyle(.tertiary)
                         Text("\(entry.fileCount) file\(entry.fileCount == 1 ? "" : "s")")
-                            .font(.caption)
+                            .font(.caption.monospacedDigit())
                             .foregroundStyle(.tertiary)
                     }
                     Spacer(minLength: 8)
@@ -386,13 +434,26 @@ private struct StorageRow: View {
                 }
                 bar
             }
+
+            if entry.kind == .dir {
+                Button(action: onOpen) {
+                    Image(systemName: "chevron.right")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.borderless)
+                .help("Open folder")
+                .accessibilityLabel("Open \(entry.name)")
+            }
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 8)
         .background(hovering ? Color.gray.opacity(0.08) : Color.clear)
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
-        .onTapGesture(count: 2) { onOpen() }
+        .onTapGesture(count: 2) {
+            if entry.kind == .dir { onOpen() }
+        }
         .contextMenu {
             if entry.kind == .dir {
                 Button("Open") { onOpen() }
@@ -417,6 +478,7 @@ private struct StorageRow: View {
             }
         }
         .frame(height: 6)
+        .accessibilityHidden(true)
     }
 
     private var percentString: String {
@@ -443,8 +505,6 @@ private struct StorageRow: View {
         }
     }
 
-    /// Visual heat: bigger entries get a bolder colour so the eye can pick
-    /// out the offenders without reading the percentages.
     private var barColor: Color {
         guard totalBytes > 0 else { return .accentColor }
         let pct = Double(entry.totalSize) / Double(totalBytes)

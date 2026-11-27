@@ -1,10 +1,7 @@
 package com.notifmirror.android.ui
 
 import android.Manifest
-import android.content.Intent
-import android.content.pm.PackageManager
 import android.os.Build
-import android.provider.Settings as SystemSettings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -15,7 +12,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
@@ -51,11 +48,10 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.core.app.NotificationManagerCompat
-import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import com.notifmirror.android.data.PairingStore
@@ -68,9 +64,7 @@ import com.notifmirror.android.ui.theme.StatusWaiting
  * Shown right after a successful QR scan. Pairing is only "done" once the
  * WebSocket actually connects — and that connection lives inside
  * [com.notifmirror.android.service.MirrorListenerService], which the system
- * only binds once notification access is granted. So instead of silently
- * bouncing back to Home, walk the user through the permissions the mirror
- * pipeline actually needs and show live connection progress.
+ * only binds once notification access is granted.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -80,25 +74,22 @@ fun SetupScreen(onDone: () -> Unit, onCancel: () -> Unit) {
     val pairing = remember { store.load() }
     val macName = pairing?.name ?: "your Mac"
 
-    var notificationAccess by remember {
-        mutableStateOf(
-            NotificationManagerCompat.getEnabledListenerPackages(context).contains(context.packageName)
-        )
-    }
-    var postNotifications by remember {
-        mutableStateOf(hasPostNotificationsPermission(context))
-    }
+    var notificationAccess by remember { mutableStateOf(isNotificationListenerEnabled(context)) }
+    var postNotifications by remember { mutableStateOf(hasPostNotificationsPermission(context)) }
+    var requestedPostNotif by remember { mutableStateOf(false) }
+
     val postNotifLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
-    ) { granted -> postNotifications = granted }
+    ) { granted ->
+        postNotifications = granted
+        requestedPostNotif = true
+    }
 
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
-                notificationAccess = NotificationManagerCompat
-                    .getEnabledListenerPackages(context)
-                    .contains(context.packageName)
+                notificationAccess = isNotificationListenerEnabled(context)
                 postNotifications = hasPostNotificationsPermission(context)
             }
         }
@@ -122,6 +113,22 @@ fun SetupScreen(onDone: () -> Unit, onCancel: () -> Unit) {
                     containerColor = Color.Transparent
                 )
             )
+        },
+        bottomBar = {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .navigationBarsPadding()
+                    .padding(horizontal = 20.dp, vertical = 12.dp)
+            ) {
+                Button(
+                    onClick = onDone,
+                    enabled = notificationAccess,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Continue")
+                }
+            }
         },
         containerColor = MaterialTheme.colorScheme.background
     ) { padding ->
@@ -153,29 +160,26 @@ fun SetupScreen(onDone: () -> Unit, onCancel: () -> Unit) {
                 subtitle = "Required — reads other apps' notifications and " +
                     "keeps the connection to your Mac alive.",
                 granted = notificationAccess,
-                onClick = {
-                    val intent = if (Build.VERSION.SDK_INT >= 30) {
-                        Intent(SystemSettings.ACTION_NOTIFICATION_LISTENER_DETAIL_SETTINGS)
-                            .putExtra(
-                                SystemSettings.EXTRA_NOTIFICATION_LISTENER_COMPONENT_NAME,
-                                "${context.packageName}/com.notifmirror.android.service.MirrorListenerService"
-                            )
-                    } else {
-                        Intent(SystemSettings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
-                    }
-                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    context.startActivity(intent)
-                }
+                onClick = { openNotificationAccessSettings(context) }
             )
 
-            if (Build.VERSION.SDK_INT >= 33) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 PermissionRow(
                     title = "Own notifications",
                     subtitle = "Lets NotifMirror itself show alerts for " +
                         "received files and test notifications.",
                     granted = postNotifications,
                     onClick = {
-                        postNotifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                        if (postNotifications || (
+                                requestedPostNotif &&
+                                    !shouldShowRationale(context, Manifest.permission.POST_NOTIFICATIONS)
+                                )
+                        ) {
+                            openAppNotificationSettings(context)
+                        } else {
+                            requestedPostNotif = true
+                            postNotifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                        }
                     }
                 )
             }
@@ -186,18 +190,6 @@ fun SetupScreen(onDone: () -> Unit, onCancel: () -> Unit) {
                 serviceConnected = serviceConnected,
                 macName = macName
             )
-
-            Spacer(Modifier.weight(1f))
-
-            Button(
-                onClick = onDone,
-                enabled = notificationAccess,
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Text("Continue")
-            }
-
-            Spacer(Modifier.height(8.dp))
         }
     }
 }
@@ -211,7 +203,9 @@ private fun PermissionRow(
 ) {
     Card(
         onClick = onClick,
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .semantics(mergeDescendants = true) {},
         shape = RoundedCornerShape(20.dp),
         colors = CardDefaults.cardColors(
             containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)
@@ -236,10 +230,11 @@ private fun PermissionRow(
                 Icon(
                     if (granted) Icons.Filled.CheckCircle else Icons.Filled.NotificationsOff,
                     contentDescription = null,
-                    tint = if (granted)
+                    tint = if (granted) {
                         MaterialTheme.colorScheme.onSecondaryContainer
-                    else
+                    } else {
                         MaterialTheme.colorScheme.onErrorContainer
+                    }
                 )
             }
             Spacer(Modifier.size(14.dp))
@@ -255,13 +250,15 @@ private fun PermissionRow(
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
+            Spacer(Modifier.size(8.dp))
             Text(
                 if (granted) "Granted" else "Tap to grant",
                 style = MaterialTheme.typography.labelMedium,
-                color = if (granted)
+                color = if (granted) {
                     MaterialTheme.colorScheme.secondary
-                else
+                } else {
                     MaterialTheme.colorScheme.error
+                }
             )
         }
     }
@@ -276,25 +273,31 @@ private fun ConnectionStatusCard(
 ) {
     val (color, label, detail) = when {
         !notificationAccess -> Triple(
-            StatusStopped, "Waiting for notification access",
+            StatusStopped,
+            "Waiting for notification access",
             "The connection can't start until you grant it above."
         )
         serviceConnected -> Triple(
-            StatusConnected, "Connected to $macName",
+            StatusConnected,
+            "Connected to $macName",
             "Notifications from your phone now appear on your Mac."
         )
         serviceRunning -> Triple(
-            StatusWaiting, "Looking for your Mac",
+            StatusWaiting,
+            "Looking for your Mac",
             "Scanning the network for $macName…"
         )
         else -> Triple(
-            StatusWaiting, "Starting…",
+            StatusWaiting,
+            "Starting…",
             "Waking up the mirror service."
         )
     }
 
     Card(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .semantics(mergeDescendants = true) {},
         shape = RoundedCornerShape(20.dp),
         colors = CardDefaults.cardColors(
             containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f)
@@ -332,15 +335,5 @@ private fun ConnectionStatusCard(
                 tint = color
             )
         }
-    }
-}
-
-private fun hasPostNotificationsPermission(context: android.content.Context): Boolean {
-    return if (Build.VERSION.SDK_INT >= 33) {
-        ContextCompat.checkSelfPermission(
-            context, Manifest.permission.POST_NOTIFICATIONS
-        ) == PackageManager.PERMISSION_GRANTED
-    } else {
-        true
     }
 }

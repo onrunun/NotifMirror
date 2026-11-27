@@ -20,6 +20,8 @@ final class ScreenMirror: ObservableObject {
     private init() {}
 
     var isRunning: Bool { process != nil }
+    var isScrcpyInstalled: Bool { Self.findBinary("scrcpy") != nil }
+    var isAdbInstalled: Bool { Self.findBinary("adb") != nil }
 
     func toggle() {
         if isRunning { stop() } else { start() }
@@ -27,8 +29,11 @@ final class ScreenMirror: ObservableObject {
 
     func start() {
         guard process == nil else { return }
+        AppState.shared.lastError = nil
 
         guard let scrcpy = Self.findBinary("scrcpy") else {
+            let msg = "scrcpy not found. Install it with Homebrew: brew install scrcpy"
+            AppState.shared.lastError = msg
             Self.showAlert(
                 title: "scrcpy not found",
                 message: "Install it with Homebrew, then try again:\n\nbrew install scrcpy"
@@ -96,6 +101,8 @@ final class ScreenMirror: ObservableObject {
                     || wasStoppedByUser
                     || Self.isBenignDisconnect(tail)
                 if !exitedNormally {
+                    let detail = tail.isEmpty ? "scrcpy exited with code \(p.terminationStatus)." : tail
+                    AppState.shared.lastError = detail
                     Self.showAlert(
                         title: "scrcpy exited (code \(p.terminationStatus))",
                         message: tail.isEmpty ? "No output captured." : tail

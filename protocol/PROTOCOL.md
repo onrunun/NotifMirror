@@ -13,7 +13,7 @@ both sides so future additions don't break older peers.
 
 ## Pairing
 
-Mac generates a 256-bit random secret AND a self-signed EC P-256 cert on
+Mac generates a 256-bit random secret AND a self-signed RSA-2048 cert on
 first launch, both stored in `~/Library/Preferences` (UserDefaults — see
 `Pairing.swift` for why this is preferred over Keychain). The pairing QR
 is a UTF-8 JSON string:
@@ -52,22 +52,36 @@ Sent immediately after TCP/WS handshake.
 
 ```json
 {"t":"hello","v":2,"proto":2,"secret":"<b64>","deviceName":"Pixel 8",
- "features":["clip","media","file"]}
+ "deviceId":"a1b2c3d4e5f60718","features":["clip","media","file","httpbulk"]}
 ```
+
+`deviceId` is an optional persistent per-install identifier allowing multiple
+Android devices to connect concurrently to one Mac (even if two phones share
+the same model name). Reconnects from the same `deviceId` cleanly replace only
+that device's previous socket.
 
 `features` is optional; it advertises which optional capabilities the client
 supports. A server that doesn't recognise a feature simply won't use it.
 
-Server validates `secret` with constant-time comparison against Keychain. On
-failure, server sends `error` and closes. On success, server sends `hello_ack`
-and starts receiving.
+Server validates `secret` with constant-time comparison. On failure, server
+sends `error` and closes. On success, server sends `hello_ack` and starts
+receiving.
 
 ### `hello_ack` — server → client
 
 ```json
 {"t":"hello_ack","v":2,"accepted":true,"serverName":"My MacBook",
- "features":["clip","media","file"]}
+ "features":["clip","media","file","fsbrowse","fsthumb","httpbulk"],
+ "dataPort":53713}
 ```
+
+When both peers advertise `"httpbulk"` and `dataPort > 0`, bulk file bodies
+(`fs_read`, `fs_write`, `file_offer`) stream directly over a dedicated
+SPKI-pinned TLS HTTP/1.1 data plane (`POST /upload/<id>` for phone → Mac,
+`GET /download/<id>` for Mac → phone, authenticated with
+`Authorization: Bearer <secret>`), bypassing WebSocket framing and XOR masking
+for full LAN line speed. Peers without `"httpbulk"` fall back automatically to
+WebSocket binary chunk frames.
 
 ### `posted` — client → server
 A new notification. `key` is `StatusBarNotification.key` (stable for the life
@@ -458,6 +472,23 @@ Body bytes for an in-flight `fs_read` (client→server) or `fs_write`
 After a write's final chunk, the client sends `fs_op_result{ok:true}` to
 confirm the file was closed and the size matched.
 
+### `fs_thumb` — server → client (feature `fsthumb`)
+Request a small JPEG thumbnail for an image or video at `path`, scaled to fit
+within `maxDim × maxDim` pixels (clamped to `64..480`, default `240`).
+Advertised alongside `fsbrowse` when `MANAGE_EXTERNAL_STORAGE` is granted.
+
+```json
+{"t":"fs_thumb","v":2,"reqId":"r10","path":"/sdcard/DCIM/Camera/IMG_0001.jpg","maxDim":240}
+```
+
+### `fs_thumb_result` — client → server
+Returns base64-encoded JPEG bytes in `data`, or an `error` string if the file
+doesn't exist or is not a supported image/video format.
+
+```json
+{"t":"fs_thumb_result","v":2,"reqId":"r10","data":"<b64 jpeg>"}
+```
+
 ---
 
 ## Screen mirroring (feature `screen`)
@@ -692,7 +723,7 @@ Known codes:
 ## Security model
 
 Threat model: personal LAN, trusted operator (you). The wire is TLS-protected
-(self-signed EC P-256 cert on the server, SPKI-pinned on the client via the
+(self-signed RSA-2048 cert on the server, SPKI-pinned on the client via the
 QR's `fp` field). A passive sniffer on the same Wi-Fi cannot read clipboard
 text, notification bodies, file contents, or browse traffic. Forward secrecy
 comes from TLS's ECDHE; replay protection from TLS sequence numbers. The

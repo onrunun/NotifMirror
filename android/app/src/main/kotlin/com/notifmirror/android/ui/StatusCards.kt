@@ -4,6 +4,7 @@ import android.graphics.BitmapFactory
 import android.util.Base64
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -16,16 +17,16 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.BatteryChargingFull
-import androidx.compose.material.icons.filled.BatteryFull
+import androidx.compose.material.icons.automirrored.filled.OpenInNew
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Upload
-import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
@@ -33,81 +34,31 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.notifmirror.android.protocol.WireMessage
+import com.notifmirror.android.service.FileBridge
 import com.notifmirror.android.service.MediaBridge
+import com.notifmirror.android.service.MirrorCore
 import com.notifmirror.android.service.TransferEntry
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
-// ---------- Battery ----------
-
-@Composable
-fun BatteryCard(battery: WireMessage.BatteryState?) {
-    if (battery == null) return
-    val charging = battery.charging
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(20.dp),
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)
-        )
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 20.dp, vertical = 16.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Icon(
-                if (charging) Icons.Filled.BatteryChargingFull else Icons.Filled.BatteryFull,
-                contentDescription = null,
-                tint = if (battery.low) MaterialTheme.colorScheme.error
-                else MaterialTheme.colorScheme.primary,
-                modifier = Modifier.size(28.dp)
-            )
-            Spacer(Modifier.size(14.dp))
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    if (battery.level >= 0) "${battery.level}%" else "—",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold,
-                    color = MaterialTheme.colorScheme.onSurface
-                )
-                Text(
-                    batteryDetail(battery),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-            if (battery.low) {
-                Icon(
-                    Icons.Filled.Warning,
-                    contentDescription = "Low battery",
-                    tint = MaterialTheme.colorScheme.error
-                )
-            }
-        }
-    }
-}
-
-private fun batteryDetail(b: WireMessage.BatteryState): String {
-    val parts = mutableListOf<String>()
-    when (b.status) {
-        "charging" -> parts.add("Charging")
-        "full" -> parts.add("Full")
-        "discharging", "not_charging" -> parts.add("On battery")
-    }
-    if (b.plugged != "none" && b.plugged != "unknown") parts.add("via ${b.plugged}")
-    b.temperatureC?.let { parts.add("%.1f°C".format(it)) }
-    if (parts.isEmpty()) parts.add("Battery")
-    return parts.joinToString(" • ")
-}
+private const val DEFAULT_TRANSFER_LIMIT = 5
 
 // ---------- Now playing ----------
 
@@ -131,7 +82,7 @@ fun NowPlayingCard(media: WireMessage.MediaState?) {
                 .padding(16.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Artwork(media)
+            Artwork(media?.artwork)
             Spacer(Modifier.width(14.dp))
             Column(modifier = Modifier.weight(1f)) {
                 Text(
@@ -159,11 +110,19 @@ fun NowPlayingCard(media: WireMessage.MediaState?) {
 }
 
 @Composable
-private fun Artwork(media: WireMessage.MediaState?) {
-    val artwork = media?.artwork?.let { decodeArtwork(it) }
-    if (artwork != null) {
+private fun Artwork(artworkBase64: String?) {
+    var artwork by remember(artworkBase64) { mutableStateOf<ImageBitmap?>(null) }
+    LaunchedEffect(artworkBase64) {
+        artwork = if (artworkBase64.isNullOrEmpty()) {
+            null
+        } else {
+            withContext(Dispatchers.Default) { decodeArtwork(artworkBase64) }
+        }
+    }
+    val bitmap = artwork
+    if (bitmap != null) {
         Image(
-            bitmap = artwork,
+            bitmap = bitmap,
             contentDescription = null,
             modifier = Modifier
                 .size(48.dp)
@@ -186,12 +145,11 @@ private fun Artwork(media: WireMessage.MediaState?) {
     }
 }
 
-private fun decodeArtwork(b64: String?): androidx.compose.ui.graphics.ImageBitmap? {
-    if (b64.isNullOrEmpty()) return null
-    return try {
-        val bytes = Base64.decode(b64, Base64.NO_WRAP)
-        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
-    } catch (_: Throwable) { null }
+private fun decodeArtwork(b64: String): ImageBitmap? = try {
+    val bytes = Base64.decode(b64, Base64.NO_WRAP)
+    BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+} catch (_: Throwable) {
+    null
 }
 
 @Composable
@@ -203,7 +161,7 @@ private fun TransportButtons(media: WireMessage.MediaState?) {
     ) {
         Icon(
             Icons.Filled.SkipPrevious,
-            contentDescription = "Previous",
+            contentDescription = "Previous track",
             tint = MaterialTheme.colorScheme.onSurfaceVariant
         )
     }
@@ -221,15 +179,25 @@ private fun TransportButtons(media: WireMessage.MediaState?) {
         onClick = { bridge?.handleCommand("next") },
         enabled = media?.canSkipNext == true && bridge != null
     ) {
-        Icon(Icons.Filled.SkipNext, contentDescription = "Next", tint = MaterialTheme.colorScheme.onSurfaceVariant)
+        Icon(
+            Icons.Filled.SkipNext,
+            contentDescription = "Next track",
+            tint = MaterialTheme.colorScheme.onSurfaceVariant
+        )
     }
 }
 
 // ---------- Transfers ----------
 
 @Composable
-fun TransferCard(transfers: List<TransferEntry>) {
+fun TransferCard(transfers: List<TransferEntry>, canRetry: Boolean = true) {
     if (transfers.isEmpty()) return
+    var showAll by remember { mutableStateOf(false) }
+    val visible = if (showAll) transfers else transfers.take(DEFAULT_TRANSFER_LIMIT)
+    val hasFinished = transfers.any {
+        it.status != TransferEntry.Status.Active && it.status != TransferEntry.Status.Pending
+    }
+
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(20.dp),
@@ -241,25 +209,66 @@ fun TransferCard(transfers: List<TransferEntry>) {
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(18.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
+            verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            Text(
-                "File transfers",
-                style = MaterialTheme.typography.titleSmall,
-                fontWeight = FontWeight.SemiBold,
-                color = MaterialTheme.colorScheme.onSurface
-            )
-            transfers.take(5).forEach { t ->
-                TransferRow(t)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    "Transfers",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.weight(1f)
+                )
+                if (hasFinished) {
+                    TextButton(onClick = { FileBridge.clearFinished() }) {
+                        Text("Clear")
+                    }
+                }
+                if (transfers.size > DEFAULT_TRANSFER_LIMIT) {
+                    TextButton(onClick = { showAll = !showAll }) {
+                        Text(if (showAll) "Less" else "All (${transfers.size})")
+                    }
+                }
+            }
+            visible.forEach { t ->
+                TransferRow(t, canRetry = canRetry)
             }
         }
     }
 }
 
 @Composable
-private fun TransferRow(t: TransferEntry) {
+private fun TransferRow(t: TransferEntry, canRetry: Boolean) {
+    val context = LocalContext.current
+    val isActive = t.status == TransferEntry.Status.Active || t.status == TransferEntry.Status.Pending
+    val canOpen = t.direction == TransferEntry.Direction.Incoming &&
+        t.status == TransferEntry.Status.Done &&
+        t.openUri != null
+    val showRetry = canRetry &&
+        t.direction == TransferEntry.Direction.Outgoing &&
+        t.status == TransferEntry.Status.Failed &&
+        t.sourceUri != null
+
+    val rowModifier = if (canOpen) {
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .clickable {
+                val intent = MirrorCore.fileBridge()?.buildOpenIntent(t)
+                if (intent != null) runCatching { context.startActivity(intent) }
+            }
+            .padding(vertical = 4.dp)
+    } else {
+        Modifier
+            .fillMaxWidth()
+            .padding(vertical = 2.dp)
+    }
+
     Row(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = rowModifier,
         verticalAlignment = Alignment.CenterVertically
     ) {
         Icon(
@@ -277,7 +286,7 @@ private fun TransferRow(t: TransferEntry) {
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )
-            if (t.status == TransferEntry.Status.Active || t.status == TransferEntry.Status.Pending) {
+            if (isActive) {
                 val progress = if (t.size > 0) t.bytesTransferred.toFloat() / t.size else 0f
                 LinearProgressIndicator(
                     progress = { progress.coerceIn(0f, 1f) },
@@ -287,14 +296,73 @@ private fun TransferRow(t: TransferEntry) {
                 )
             }
             Spacer(Modifier.height(2.dp))
-            val sizeText = if (t.size > 0) " / ${formatBytes(t.size)}" else ""
             Text(
-                "${t.status.label} • ${formatBytes(t.bytesTransferred)}$sizeText",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
+                formatTransferStatus(t),
+                style = MaterialTheme.typography.labelSmall.copy(fontFeatureSettings = "tnum"),
+                color = if (t.status == TransferEntry.Status.Failed) {
+                    MaterialTheme.colorScheme.error
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                }
             )
         }
+        TransferTrailingAction(
+            entry = t,
+            isActive = isActive,
+            showRetry = showRetry,
+            canOpen = canOpen
+        )
     }
+}
+
+@Composable
+private fun TransferTrailingAction(
+    entry: TransferEntry,
+    isActive: Boolean,
+    showRetry: Boolean,
+    canOpen: Boolean
+) {
+    when {
+        isActive -> IconButton(onClick = { MirrorCore.fileBridge()?.cancel(entry.id) }) {
+            Icon(
+                Icons.Filled.Close,
+                contentDescription = "Cancel transfer ${entry.name}",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        showRetry -> IconButton(onClick = { MirrorCore.fileBridge()?.retry(entry.id) }) {
+            Icon(
+                Icons.Filled.Refresh,
+                contentDescription = "Retry sending ${entry.name}",
+                tint = MaterialTheme.colorScheme.primary
+            )
+        }
+        canOpen -> Icon(
+            Icons.AutoMirrored.Filled.OpenInNew,
+            contentDescription = "Open ${entry.name}",
+            tint = MaterialTheme.colorScheme.primary,
+            modifier = Modifier
+                .padding(horizontal = 8.dp)
+                .size(18.dp)
+        )
+    }
+}
+
+private fun formatTransferStatus(t: TransferEntry): String {
+    val sizeText = if (t.size > 0) " / ${formatBytes(t.size)}" else ""
+    val errText = t.errorMessage?.let { humanTransferError(it) }
+    val status = if (t.status == TransferEntry.Status.Failed && errText != null) {
+        "Failed ($errText)"
+    } else {
+        t.status.label
+    }
+    return "$status • ${formatBytes(t.bytesTransferred)}$sizeText"
+}
+
+private fun humanTransferError(code: String): String = when (code) {
+    "size_mismatch" -> "incomplete file"
+    "io_error" -> "storage error"
+    else -> code.replace('_', ' ')
 }
 
 private val TransferEntry.Status.label: String

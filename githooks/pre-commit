@@ -9,9 +9,12 @@ set -u
 
 # File name / path patterns that must never be committed.
 blocked_paths=(
-    '\.(jks|keystore|p12|pfx|pkcs12|mobileprovision)$'
+    '\.(jks|keystore|p12|pfx|pkcs12|mobileprovision|pem|key)$'
     '(^|/)\.env($|[^e])'
     '(^|/)local\.properties$'
+    '(^|/)keystore\.properties$'
+    '(^|/)\.(impeccable|zcode|claude)(/|$)'
+    '(^|/)(PRODUCT|DESIGN)\.md$'
 )
 
 # High-confidence secret patterns, scanned in the staged content of every file.
@@ -27,9 +30,11 @@ always_flag=(
     'Authorization[[:space:]]*:[[:space:]]*Bearer[[:space:]][A-Za-z0-9._~+/=-]{20,}'
 )
 
-# Gradle signing configs store keystore credentials; flag real-looking values.
-password_assign='(storePassword|keyPassword)[[:space:]]*[:=][[:space:]]*["'"'"'][^"'"'"']+["'"'"']'
+# Gradle signing configs and .properties files store keystore credentials;
+# flag real-looking values (both quoted Gradle literals and unquoted .properties lines).
+password_assign='(storePassword|keyPassword)[[:space:]]*[:=][[:space:]]*[^[:space:]#]+'
 placeholder_re='^(android|changeit|changeme|secret|password|123456|your_password|your-password|placeholder)$'
+code_expr_re='^(%|\$|keystoreProperties|System\.|providers\.|project\.|env\.|findProperty)'
 
 if [[ "${SKIP_SECRET_CHECK:-}" == "1" ]]; then
     exit 0
@@ -58,8 +63,12 @@ while IFS= read -r -d '' file; do
 
     while IFS= read -r m; do
         line="${m%%:*}"
-        val="$(printf '%s' "$m" | sed -E "s/.*[[:space:]]*[:=][[:space:]]*[\"']([^\"']+)[\"'].*/\1/")"
-        if [[ ${#val} -ge 6 ]] && ! printf '%s' "$val" | grep -qiE "$placeholder_re"; then
+        raw="${m#*:}"
+        val="$(printf '%s' "$raw" | sed -E "s/.*(storePassword|keyPassword)[[:space:]]*[:=][[:space:]]*//; s/^[[:space:]]*[\"']?//; s/[\"']?[[:space:]]*$//")"
+        if [[ ${#val} -ge 6 ]] \
+            && [[ "$val" != *"("* ]] \
+            && ! printf '%s' "$val" | grep -qiE "$placeholder_re" \
+            && ! printf '%s' "$val" | grep -qE "$code_expr_re"; then
             problems=$((problems + 1))
             echo "  $rel:$line: hardcoded keystore credential, refusing to commit" >&2
         fi

@@ -31,18 +31,20 @@ class MirrorCore(context: Context) : WsClientCallbacks {
     private val executor: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor()
     private var pairing: com.notifmirror.android.data.PairingPayload? = null
     private var ws: WsClient? = null
+    private var bulkClient: BulkTransferClient? = null
     private var discovery: Discovery? = null
     private var backoffSeconds = 1L
     private var connectivity: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
-    /// Features advertised in HELLO. `fsbrowse` is conditional on the
-    /// MANAGE_EXTERNAL_STORAGE runtime grant.
+    /// Features advertised in HELLO. `fsbrowse` + `fsthumb` are conditional on
+    /// the MANAGE_EXTERNAL_STORAGE runtime grant.
     private fun currentFeatures(): List<String> {
-        val base = mutableListOf("clip", "media", "file", "battery")
+        val base = mutableListOf("clip", "media", "file", "battery", "httpbulk")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
             android.os.Environment.isExternalStorageManager()) {
             base.add("fsbrowse")
+            base.add("fsthumb")
         }
         return base
     }
@@ -55,6 +57,9 @@ class MirrorCore(context: Context) : WsClientCallbacks {
 
     @Volatile private var lastResolvedHost: String? = null
     @Volatile private var lastResolvedPort: Int = 0
+    @Volatile private var activeHost: String? = null
+    @Volatile private var bulkPort: Int = 0
+    @Volatile private var serverSupportsHttpBulk: Boolean = false
 
     /// Held only while a file transfer is in flight. Forces the Wi-Fi radio
     /// to stay fully powered (no micro-sleeps between packets) — fixes the
@@ -158,7 +163,20 @@ class MirrorCore(context: Context) : WsClientCallbacks {
     private fun ensureRunning() {
         val store = PairingStore(appContext)
         val p = store.load() ?: run {
-            Log.i(TAG, "no pairing yet — idle")
+            Log.i(TAG, "no pairing — tearing down active WebSocket")
+            ws?.close()
+            ws = null
+            bulkClient?.cancelAll()
+            bulkClient = null
+            pairing = null
+            lastResolvedHost = null
+            lastResolvedPort = 0
+            activeHost = null
+            bulkPort = 0
+            serverSupportsHttpBulk = false
+            discovery?.stop()
+            discovery = null
+            _connectedFlow.value = false
             return
         }
         val previous = pairing
@@ -172,12 +190,15 @@ class MirrorCore(context: Context) : WsClientCallbacks {
             if (changed && ws != null) {
                 Log.i(TAG, "pairing changed — recreating WsClient")
                 ws?.close()
+                bulkClient?.cancelAll()
                 lastResolvedHost = null
                 lastResolvedPort = 0
             }
+            bulkClient = BulkTransferClient(p.fp)
             ws = WsClient(
                 secret = p.secret,
                 deviceName = Build.MODEL ?: "Android",
+                deviceId = com.notifmirror.android.data.Settings.get(appContext).deviceId,
                 features = currentFeatures(),
                 serverFp = p.fp,
                 callbacks = this
@@ -204,6 +225,7 @@ class MirrorCore(context: Context) : WsClientCallbacks {
         if (w.isConnected) return
         val host = lastResolvedHost ?: pairing?.host ?: return
         val port = if (lastResolvedPort > 0) lastResolvedPort else pairing?.port ?: return
+        activeHost = host
         Log.i(TAG, "connecting to $host:$port")
         w.connect(host, port)
     }
@@ -247,8 +269,10 @@ class MirrorCore(context: Context) : WsClientCallbacks {
     override fun onConnected() { Log.i(TAG, "ws connected") }
 
     override fun onAuthenticated(serverName: String, serverFeatures: List<String>, dataPort: Int) {
-        Log.i(TAG, "authenticated with $serverName (features: $serverFeatures)")
+        Log.i(TAG, "authenticated with $serverName (features: $serverFeatures, bulkPort: $dataPort)")
         backoffSeconds = 1
+        bulkPort = dataPort
+        serverSupportsHttpBulk = dataPort > 0 && "httpbulk" in serverFeatures
         _connectedFlow.value = true
         // Push current media snapshot right away so the Mac menu isn't empty.
         mediaBridge.publishIfConnected()
@@ -257,7 +281,6 @@ class MirrorCore(context: Context) : WsClientCallbacks {
         batteryBridge.publishIfConnected()
         // Push our muted-app list so the two sides converge on reconnect.
         pushBlocklist()
-        // dataPort is retired — bulk file bytes now ride as WS binary frames.
     }
 
     /** Ship the current muted-app snapshot to the Mac. No-op when the socket
@@ -275,6 +298,9 @@ class MirrorCore(context: Context) : WsClientCallbacks {
     override fun onDisconnected() {
         Log.i(TAG, "ws disconnected, scheduling reconnect")
         _connectedFlow.value = false
+        bulkPort = 0
+        serverSupportsHttpBulk = false
+        bulkClient?.cancelAll()
         try { _fileBridge.cancelAll() } catch (_: Throwable) {}
         try { fileBrowseBridge.cancelAll() } catch (_: Throwable) {}
         scheduleReconnect()
@@ -453,5 +479,25 @@ class MirrorCore(context: Context) : WsClientCallbacks {
         /// Exposed for diagnostic logging — report whether the Wi-Fi high-perf
         /// lock is currently held by this process.
         fun isWifiLockHeld(): Boolean = instance?.wifiHighPerfLock?.isHeld == true
+
+        internal data class BulkEndpoint(
+            val host: String,
+            val port: Int,
+            val secret: String,
+            val client: BulkTransferClient
+        )
+
+        internal fun bulkEndpoint(): BulkEndpoint? {
+            val s = instance ?: return null
+            if (!s.serverSupportsHttpBulk || s.bulkPort <= 0) return null
+            val host = s.activeHost ?: s.pairing?.host ?: return null
+            val secret = s.pairing?.secret ?: return null
+            val client = s.bulkClient ?: return null
+            return BulkEndpoint(host, s.bulkPort, secret, client)
+        }
+
+        internal fun cancelBulk(id: String) {
+            instance?.bulkClient?.cancel(id)
+        }
     }
 }

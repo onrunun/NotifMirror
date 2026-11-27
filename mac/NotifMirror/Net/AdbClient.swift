@@ -438,113 +438,152 @@ enum AdbClient {
     ) async throws -> String {
         guard let adb = findAdb() else { throw AdbError.adbNotFound }
 
-        return try await withCheckedThrowingContinuation { continuation in
-            let proc = Process()
-            proc.executableURL = URL(fileURLWithPath: adb)
-            proc.arguments = args
+        let procBox = ProcessBox()
 
-            let outPipe = Pipe()
-            let errPipe = Pipe()
-            proc.standardOutput = outPipe
-            proc.standardError = errPipe
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
 
-            var env = ProcessInfo.processInfo.environment
-            let extraPath = searchDirs.joined(separator: ":")
-            env["PATH"] = (env["PATH"].map { "\(extraPath):\($0)" }) ?? extraPath
-            proc.environment = env
+                let proc = Process()
+                proc.executableURL = URL(fileURLWithPath: adb)
+                proc.arguments = args
 
-            let stdoutBuf = StringBuffer()
-            let stderrBuf = StringBuffer()
+                let outPipe = Pipe()
+                let errPipe = Pipe()
+                proc.standardOutput = outPipe
+                proc.standardError = errPipe
 
-            // Lines that span across pipe chunks need a buffered splitter
-            // or we'd drop/mangle a row at each boundary. Stderr uses the
-            // older split-per-chunk behavior because adb's \r-separated
-            // progress output tolerates it.
-            let stdoutLines = LineSplitter()
+                var env = ProcessInfo.processInfo.environment
+                let extraPath = searchDirs.joined(separator: ":")
+                env["PATH"] = (env["PATH"].map { "\(extraPath):\($0)" }) ?? extraPath
+                proc.environment = env
 
-            errPipe.fileHandleForReading.readabilityHandler = { handle in
-                let data = handle.availableData
-                if data.isEmpty { return }
-                guard let text = String(data: data, encoding: .utf8) else { return }
-                stderrBuf.append(text)
-                if let onStderrLine {
-                    // adb refreshes progress with \r; split on both.
-                    for line in text.split(whereSeparator: { $0 == "\n" || $0 == "\r" }) {
-                        let s = String(line).trimmingCharacters(in: .whitespaces)
-                        if !s.isEmpty { onStderrLine(s) }
+                let stdoutBuf = StringBuffer()
+                let stderrBuf = StringBuffer()
+                let stdoutLines = LineSplitter()
+
+                errPipe.fileHandleForReading.readabilityHandler = { handle in
+                    let data = handle.availableData
+                    if data.isEmpty { return }
+                    guard let text = String(data: data, encoding: .utf8) else { return }
+                    stderrBuf.append(text)
+                    if let onStderrLine {
+                        for line in text.split(whereSeparator: { $0 == "\n" || $0 == "\r" }) {
+                            let s = String(line).trimmingCharacters(in: .whitespaces)
+                            if !s.isEmpty { onStderrLine(s) }
+                        }
                     }
                 }
-            }
-            outPipe.fileHandleForReading.readabilityHandler = { handle in
-                let data = handle.availableData
-                if data.isEmpty { return }
-                guard let text = String(data: data, encoding: .utf8) else { return }
-                stdoutBuf.append(text)
-                if let onStdoutLine {
-                    for line in stdoutLines.feed(text) where !line.isEmpty {
-                        onStdoutLine(line)
-                    }
-                }
-            }
-
-            var didFinish = false
-            let lock = NSLock()
-
-            proc.terminationHandler = { p in
-                lock.lock()
-                if didFinish { lock.unlock(); return }
-                didFinish = true
-                lock.unlock()
-
-                errPipe.fileHandleForReading.readabilityHandler = nil
-                outPipe.fileHandleForReading.readabilityHandler = nil
-
-                // Drain any final data.
-                let remainingOut = outPipe.fileHandleForReading.readDataToEndOfFile()
-                let remainingErr = errPipe.fileHandleForReading.readDataToEndOfFile()
-                if !remainingOut.isEmpty, let s = String(data: remainingOut, encoding: .utf8) {
-                    stdoutBuf.append(s)
+                outPipe.fileHandleForReading.readabilityHandler = { handle in
+                    let data = handle.availableData
+                    if data.isEmpty { return }
+                    guard let text = String(data: data, encoding: .utf8) else { return }
+                    stdoutBuf.append(text)
                     if let onStdoutLine {
-                        for line in stdoutLines.feed(s) where !line.isEmpty {
+                        for line in stdoutLines.feed(text) where !line.isEmpty {
                             onStdoutLine(line)
                         }
                     }
                 }
-                if !remainingErr.isEmpty, let s = String(data: remainingErr, encoding: .utf8) {
-                    stderrBuf.append(s)
-                }
-                if let onStdoutLine, let tail = stdoutLines.flush(), !tail.isEmpty {
-                    onStdoutLine(tail)
+
+                var didFinish = false
+                let lock = NSLock()
+
+                proc.terminationHandler = { p in
+                    lock.lock()
+                    if didFinish { lock.unlock(); return }
+                    didFinish = true
+                    lock.unlock()
+
+                    errPipe.fileHandleForReading.readabilityHandler = nil
+                    outPipe.fileHandleForReading.readabilityHandler = nil
+
+                    let remainingOut = outPipe.fileHandleForReading.readDataToEndOfFile()
+                    let remainingErr = errPipe.fileHandleForReading.readDataToEndOfFile()
+                    if !remainingOut.isEmpty, let s = String(data: remainingOut, encoding: .utf8) {
+                        stdoutBuf.append(s)
+                        if let onStdoutLine {
+                            for line in stdoutLines.feed(s) where !line.isEmpty {
+                                onStdoutLine(line)
+                            }
+                        }
+                    }
+                    if !remainingErr.isEmpty, let s = String(data: remainingErr, encoding: .utf8) {
+                        stderrBuf.append(s)
+                    }
+                    if let onStdoutLine, let tail = stdoutLines.flush(), !tail.isEmpty {
+                        onStdoutLine(tail)
+                    }
+
+                    let stdout = stdoutBuf.value
+                    let stderr = stderrBuf.value
+
+                    if procBox.wasCancelled {
+                        continuation.resume(throwing: CancellationError())
+                    } else if p.terminationStatus == 0 {
+                        continuation.resume(returning: stdout)
+                    } else {
+                        continuation.resume(throwing: AdbError.failed(
+                            code: p.terminationStatus,
+                            stderr: stderr.isEmpty ? stdout : stderr
+                        ))
+                    }
                 }
 
-                let stdout = stdoutBuf.value
-                let stderr = stderrBuf.value
+                do {
+                    try proc.run()
+                    procBox.set(proc)
+                } catch {
+                    continuation.resume(throwing: error)
+                    return
+                }
 
-                if p.terminationStatus == 0 {
-                    continuation.resume(returning: stdout)
-                } else {
-                    continuation.resume(throwing: AdbError.failed(
-                        code: p.terminationStatus,
-                        stderr: stderr.isEmpty ? stdout : stderr
-                    ))
+                DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+                    lock.lock()
+                    let alreadyDone = didFinish
+                    lock.unlock()
+                    if !alreadyDone && proc.isRunning {
+                        proc.terminate()
+                    }
                 }
             }
+        } onCancel: {
+            procBox.cancel()
+        }
+    }
+}
 
-            do {
-                try proc.run()
-            } catch {
-                continuation.resume(throwing: error)
-                return
-            }
+private final class ProcessBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var proc: Process?
+    private var cancelled = false
 
-            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
-                lock.lock()
-                let alreadyDone = didFinish
-                lock.unlock()
-                if !alreadyDone && proc.isRunning {
-                    proc.terminate()
-                }
-            }
+    var wasCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+
+    func set(_ process: Process) {
+        lock.lock()
+        let shouldKill = cancelled
+        proc = process
+        lock.unlock()
+        if shouldKill && process.isRunning {
+            process.terminate()
+        }
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        let running = proc
+        lock.unlock()
+        if let running, running.isRunning {
+            running.terminate()
         }
     }
 }
