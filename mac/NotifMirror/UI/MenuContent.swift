@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct MenuContent: View {
     @EnvironmentObject var state: AppState
@@ -8,21 +9,40 @@ struct MenuContent: View {
     @Environment(\.openWindow) private var openWindow
 
     @State private var pendingVolume: Double? = nil
+    @State private var quickText: String = ""
+    @State private var quickSentFlash: Bool = false
+    @State private var copiedLatestClip: Bool = false
+    @State private var isDropTarget: Bool = false
+
+    private var canSendFiles: Bool {
+        state.isClientConnected && state.peerFeatures.contains("file")
+    }
+
+    private var canUseClip: Bool {
+        state.isClientConnected && state.peerFeatures.contains("clip")
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             header
 
-            Divider()
-
-            openWindowButton
-
-            if !history.entries.isEmpty {
-                Divider()
-                recentNotifications
+            if state.devices.count > 1 {
+                deviceSwitcherStrip
             }
 
-            // Quick media controls only when a session is active.
+            controlTiles
+
+            if canUseClip {
+                quickClipboardBar
+            }
+
+            let activeTransfers = state.transfers.values
+                .filter { $0.isInFlight }
+                .sorted { $0.startedAt > $1.startedAt }
+            if !activeTransfers.isEmpty {
+                activeTransfersStrip(items: activeTransfers)
+            }
+
             if state.isClientConnected
                 && state.peerFeatures.contains("media")
                 && prefs.mediaControlEnabled
@@ -31,51 +51,48 @@ struct MenuContent: View {
                 miniPlayer
             }
 
-            if state.isClientConnected && state.peerFeatures.contains("clip") {
+            if !history.entries.isEmpty {
                 Divider()
-                clipboardToggle
+                recentNotifications
             }
-
-            if state.isClientConnected && state.peerFeatures.contains("file") {
-                Divider()
-                Button(action: pickAndSendFile) {
-                    Label("Send file to phone…", systemImage: "paperplane.fill")
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .buttonStyle(.borderless)
-            }
-
-            Divider()
-
-            Button {
-                ScreenMirror.shared.toggle()
-            } label: {
-                Label(
-                    state.scrcpyRunning ? "Stop screen mirror" : "Mirror screen (scrcpy)",
-                    systemImage: state.scrcpyRunning ? "stop.circle" : "display"
-                )
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .buttonStyle(.borderless)
-
-            Divider()
-
-            quickLinks
 
             if let err = state.lastError {
-                Text("Error: \(err)").font(.caption).foregroundStyle(.red)
+                Label(err, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             Divider()
 
-            Button(role: .destructive) { NSApp.terminate(nil) } label: {
-                Label("Quit NotifMirror", systemImage: "power")
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .buttonStyle(.borderless)
-            .keyboardShortcut("q")
+            footerStrip
         }
         .padding(12)
+        .overlay {
+            if isDropTarget {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(canSendFiles ? Color.accentColor : Color.orange, lineWidth: 2)
+                    .background(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill((canSendFiles ? Color.accentColor : Color.orange).opacity(0.10))
+                    )
+                    .overlay {
+                        Label(
+                            canSendFiles
+                                ? "Drop to send to \(state.pairedDeviceName ?? "phone")"
+                                : "Connect phone to send files",
+                            systemImage: canSendFiles ? "paperplane.circle.fill" : "exclamationmark.triangle.fill"
+                        )
+                        .font(.callout.weight(.semibold))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(.regularMaterial, in: Capsule())
+                    }
+                    .padding(4)
+                    .allowsHitTesting(false)
+            }
+        }
+        .onDrop(of: [.fileURL], isTargeted: $isDropTarget, perform: handleDrop)
         .onChange(of: state.media.volume) { _, _ in pendingVolume = nil }
     }
 
@@ -85,14 +102,13 @@ struct MenuContent: View {
         HStack(spacing: 10) {
             ZStack {
                 RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .fill(state.isClientConnected
-                          ? Color.green.opacity(0.22)
-                          : Color.secondary.opacity(0.18))
-                Image(systemName: state.isClientConnected ? "bell.badge.fill" : "bell")
-                    .foregroundStyle(state.isClientConnected ? .green : .secondary)
+                    .fill(statusTint.opacity(0.20))
+                Image(systemName: statusSymbol)
+                    .foregroundStyle(statusTint)
                     .font(.system(size: 15, weight: .semibold))
             }
             .frame(width: 28, height: 28)
+            .accessibilityHidden(true)
 
             VStack(alignment: .leading, spacing: 1) {
                 Text(state.isClientConnected
@@ -100,25 +116,112 @@ struct MenuContent: View {
                      : "Waiting for phone…")
                     .font(.headline)
                     .lineLimit(1)
-                Text("Port \(state.listenerPort == 0 ? "—" : String(state.listenerPort)) • \(state.notificationsMirroredCount) mirrored")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Text(headerSubtitle)
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(state.isMirroringPaused ? .orange : .secondary)
+                    .lineLimit(1)
             }
-            Spacer(minLength: 0)
+            Spacer(minLength: 4)
 
             if state.isClientConnected,
                state.peerFeatures.contains("battery"),
                let battery = state.battery {
                 batteryBadge(battery)
             }
+
+            Button {
+                MainWindowSelection.shared.openPairing(isConnected: state.isClientConnected)
+                openWindow(id: "main")
+                NSApp.activate(ignoringOtherApps: true)
+            } label: {
+                Image(systemName: "qrcode")
+                    .font(.system(size: 13, weight: .medium))
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .help("Pairing QR (⌘P)")
+            .accessibilityLabel("Show Pairing QR")
+            .keyboardShortcut("p")
+
+            Button {
+                openMain(section: .overview)
+            } label: {
+                Image(systemName: "macwindow")
+                    .font(.system(size: 13, weight: .medium))
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+            .help("Open NotifMirror window (⌘O)")
+            .accessibilityLabel("Open NotifMirror window")
+            .keyboardShortcut("o")
+        }
+    }
+
+    private var statusSymbol: String {
+        if state.isMirroringPaused { return "bell.slash.fill" }
+        return state.isClientConnected ? "bell.badge.fill" : "bell"
+    }
+
+    private var statusTint: Color {
+        if state.isMirroringPaused { return .orange }
+        return state.isClientConnected ? .green : .secondary
+    }
+
+    private var headerSubtitle: String {
+        if let pause = state.pauseLabel { return pause }
+        let port = state.listenerPort == 0 ? "—" : String(state.listenerPort)
+        if state.devices.count > 1 {
+            return "\(state.devices.count) phones • \(history.entries.count) in history"
+        }
+        return "Port \(port) • \(history.entries.count) in history"
+    }
+
+    private var deviceSwitcherStrip: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(state.devices) { device in
+                    let active = device.id == state.activeDevice?.id
+                    Button {
+                        state.selectDevice(device.id)
+                    } label: {
+                        HStack(spacing: 5) {
+                            Circle()
+                                .fill(active ? Color.green : Color.secondary.opacity(0.5))
+                                .frame(width: 6, height: 6)
+                            Text(device.name)
+                                .font(.caption.weight(active ? .semibold : .regular))
+                                .lineLimit(1)
+                            if let b = device.battery, b.hasLevel {
+                                Text("\(b.level)%")
+                                    .font(.caption2.monospacedDigit())
+                                    .foregroundStyle(b.tint)
+                            }
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(
+                            Capsule().fill(active
+                                           ? Color.accentColor.opacity(0.16)
+                                           : Color(nsColor: .controlBackgroundColor))
+                        )
+                        .overlay(
+                            Capsule().stroke(
+                                active ? Color.accentColor.opacity(0.42) : Color.primary.opacity(0.08),
+                                lineWidth: 1
+                            )
+                        )
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
         }
     }
 
     @ViewBuilder
     private func batteryBadge(_ b: BatterySnapshot) -> some View {
-        HStack(spacing: 4) {
+        HStack(spacing: 3) {
             Image(systemName: b.sfSymbol)
-                .font(.system(size: 14, weight: .semibold))
+                .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(b.tint)
             Text(b.hasLevel ? "\(b.level)%" : "—")
                 .font(.caption.weight(.medium))
@@ -126,6 +229,8 @@ struct MenuContent: View {
                 .foregroundStyle(b.tint)
         }
         .help(batteryTooltip(b))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Phone battery: \(batteryTooltip(b))")
     }
 
     private func batteryTooltip(_ b: BatterySnapshot) -> String {
@@ -137,44 +242,286 @@ struct MenuContent: View {
         return parts.isEmpty ? "Battery state unknown" : parts.joined(separator: " • ")
     }
 
-    // MARK: - Open button
+    // MARK: - 2×2 Control Center Tiles
 
-    private var openWindowButton: some View {
-        Button {
-            openMain(section: .overview)
-        } label: {
-            HStack {
-                Label("Open NotifMirror", systemImage: "macwindow")
-                Spacer()
-                Image(systemName: "arrow.up.right.square")
-                    .foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .contentShape(Rectangle())
+    private var controlTiles: some View {
+        let cols = [GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8)]
+        return LazyVGrid(columns: cols, spacing: 8) {
+            pauseTile
+            clipboardTile
+            sendFilesTile
+            screenMirrorTile
         }
-        .buttonStyle(.borderedProminent)
-        .controlSize(.large)
-        .keyboardShortcut("o")
     }
 
-    // MARK: - Recent notifications
+    @ViewBuilder
+    private var pauseTile: some View {
+        if state.isMirroringPaused {
+            Button {
+                state.resumeMirroring()
+            } label: {
+                tileChrome(
+                    symbol: "bell.slash.fill",
+                    title: "Paused",
+                    subtitle: "Click to resume",
+                    active: true,
+                    tint: .orange
+                )
+            }
+            .buttonStyle(.plain)
+            .help("Resume notification banners")
+        } else {
+            Menu {
+                Button("Pause for 30 minutes") { state.pauseMirroring(for: 30 * 60) }
+                Button("Pause for 1 hour") { state.pauseMirroring(for: 60 * 60) }
+                Divider()
+                Button("Pause until resumed") { state.pauseMirroring(for: nil) }
+            } label: {
+                tileChrome(
+                    symbol: "bell.slash",
+                    title: "Pause banners",
+                    subtitle: "Presentation mode",
+                    active: false,
+                    tint: .orange
+                )
+            }
+            .menuStyle(.borderlessButton)
+            .help("Temporarily hide macOS banners while presenting or focusing")
+        }
+    }
+
+    private var clipboardTile: some View {
+        Button {
+            prefs.clipboardSyncEnabled.toggle()
+        } label: {
+            tileChrome(
+                symbol: "doc.on.clipboard",
+                title: "Clipboard sync",
+                subtitle: clipboardTileSubtitle,
+                active: prefs.clipboardSyncEnabled,
+                tint: .accentColor
+            )
+        }
+        .buttonStyle(.plain)
+        .disabled(!canUseClip)
+        .opacity(canUseClip ? 1 : 0.5)
+        .help("Toggle automatic clipboard text sync over LAN")
+    }
+
+    private var clipboardTileSubtitle: String {
+        if !canUseClip { return "Phone offline" }
+        if prefs.clipboardSyncEnabled {
+            if let dir = state.lastClipDirection, let at = state.lastClipAt {
+                return "\(dir == .incoming ? "←" : "→") \(Self.relative(at))"
+            }
+            return "Active"
+        }
+        return "Off"
+    }
+
+    private var sendFilesTile: some View {
+        Button {
+            FileSendPicker.pickAndSend()
+        } label: {
+            tileChrome(
+                symbol: "paperplane.fill",
+                title: "Send files",
+                subtitle: canSendFiles ? "Click or drop here" : "Phone offline",
+                active: isDropTarget && canSendFiles,
+                tint: .accentColor
+            )
+        }
+        .buttonStyle(.plain)
+        .disabled(!canSendFiles)
+        .opacity(canSendFiles ? 1 : 0.5)
+        .help("Send files to phone, or drag and drop onto this popover")
+    }
+
+    private var screenMirrorTile: some View {
+        Button {
+            ScreenMirror.shared.toggle()
+        } label: {
+            tileChrome(
+                symbol: state.scrcpyRunning ? "display" : "display",
+                title: "Mirror screen",
+                subtitle: state.scrcpyRunning ? "Running — stop" : "scrcpy",
+                active: state.scrcpyRunning,
+                tint: .green
+            )
+        }
+        .buttonStyle(.plain)
+        .help(state.scrcpyRunning ? "Stop scrcpy screen mirror" : "Start scrcpy screen mirror")
+    }
+
+    private func tileChrome(
+        symbol: String,
+        title: String,
+        subtitle: String,
+        active: Bool,
+        tint: Color
+    ) -> some View {
+        HStack(spacing: 8) {
+            ZStack {
+                Circle()
+                    .fill(active ? tint : Color.primary.opacity(0.08))
+                Image(systemName: symbol)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(active ? Color.white : Color.primary)
+            }
+            .frame(width: 26, height: 26)
+            .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                Text(subtitle)
+                    .font(.caption2)
+                    .foregroundStyle(active ? tint : .secondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(active ? tint.opacity(0.14) : Color(nsColor: .controlBackgroundColor))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(active ? tint.opacity(0.38) : Color.primary.opacity(0.08), lineWidth: 1)
+        )
+        .contentShape(Rectangle())
+    }
+
+    // MARK: - Quick Send Text & Latest Clip
+
+    private var quickClipboardBar: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                TextField("Send text or link to phone…", text: $quickText)
+                    .textFieldStyle(.roundedBorder)
+                    .controlSize(.small)
+                    .onSubmit { sendQuickText() }
+                Button {
+                    sendQuickText()
+                } label: {
+                    Image(systemName: quickSentFlash ? "checkmark" : "paperplane.fill")
+                        .foregroundStyle(quickSentFlash ? Color.green : Color.accentColor)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(quickText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !quickSentFlash)
+                .help("Send text to phone clipboard")
+                .accessibilityLabel("Send text to phone clipboard")
+            }
+
+            if let latest = state.clipHistory.first(where: { $0.direction == .incoming }) {
+                Button {
+                    ClipboardSync.shared.copyToLocalPasteboard(latest.text)
+                    copiedLatestClip = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) { copiedLatestClip = false }
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: copiedLatestClip ? "checkmark" : "doc.on.doc")
+                            .font(.caption2)
+                            .foregroundStyle(copiedLatestClip ? .green : .secondary)
+                        Text(copiedLatestClip
+                             ? "Copied latest phone clip"
+                             : "Phone clip: \(latest.text.replacingOccurrences(of: "\n", with: " "))")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(Color.primary.opacity(0.05))
+                    )
+                }
+                .buttonStyle(.plain)
+                .help("Copy latest clip received from phone")
+            }
+        }
+    }
+
+    private func sendQuickText() {
+        guard ClipboardSync.shared.sendManualText(quickText) else { return }
+        quickText = ""
+        quickSentFlash = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { quickSentFlash = false }
+    }
+
+    // MARK: - Active Transfers Strip
+
+    private func activeTransfersStrip(items: [TransferProgress]) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            ForEach(items.prefix(2), id: \.id) { t in
+                let pct = t.size > 0 ? min(1, Double(t.bytesTransferred) / Double(t.size)) : 0
+                HStack(spacing: 6) {
+                    Image(systemName: t.direction == .incoming ? "arrow.down.circle.fill" : "arrow.up.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(t.direction == .incoming ? .blue : .green)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(t.name).font(.caption).lineLimit(1)
+                        ProgressView(value: pct).controlSize(.small)
+                    }
+                    Text("\(Int(pct * 100))%")
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .frame(width: 28, alignment: .trailing)
+                    Button {
+                        FileTransferCenter.shared.cancel(xid: t.id)
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Cancel transfer")
+                }
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color(nsColor: .controlBackgroundColor))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(Color.primary.opacity(0.06), lineWidth: 1)
+        )
+    }
+
+    // MARK: - Recent Notifications (with inline 2FA + Quick Reply)
 
     private var recentNotifications: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
-                Text("Recent").font(.caption).foregroundStyle(.secondary)
+                Text("Recent").font(.caption.weight(.medium)).foregroundStyle(.secondary)
                 Spacer()
                 if history.entries.count > 3 {
                     Button {
                         openMain(section: .notifications)
                     } label: {
-                        Text("See all").font(.caption)
+                        Text("See all (\(history.entries.count))")
+                            .font(.caption.monospacedDigit())
                     }
                     .buttonStyle(.borderless)
                 }
             }
             ForEach(Array(history.entries.prefix(3))) { entry in
-                MenuRecentRow(entry: entry) {
+                MenuRecentRow(
+                    entry: entry,
+                    canReply: state.isClientConnected,
+                    showDeviceBadge: state.devices.count > 1
+                ) {
                     MainWindowSelection.shared.pendingNotificationKey = entry.key
                     openMain(section: .notifications)
                 }
@@ -182,32 +529,7 @@ struct MenuContent: View {
         }
     }
 
-    // MARK: - Quick links
-
-    private var quickLinks: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            linkRow("clock.arrow.circlepath", "Notifications", .notifications, "n")
-            linkRow("folder.fill", "Phone files", .files, "f")
-            linkRow("qrcode", "Pairing", .pairing, "p")
-            linkRow("square.grid.3x3.square", "Mirrored apps", .apps, nil)
-            linkRow("gearshape.fill", "Settings", .settings, ",")
-        }
-    }
-
-    private func linkRow(_ symbol: String, _ title: String,
-                         _ section: MainSection,
-                         _ shortcut: KeyEquivalent?) -> some View {
-        Button {
-            openMain(section: section)
-        } label: {
-            Label(title, systemImage: symbol)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .buttonStyle(.borderless)
-        .modifier(OptionalKeyboardShortcut(key: shortcut))
-    }
-
-    // MARK: - Mini player
+    // MARK: - Mini Player
 
     private var miniPlayer: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -223,13 +545,17 @@ struct MenuContent: View {
                     }
 
                     HStack(spacing: 6) {
-                        transportButton("backward.fill", enabled: state.media.canSkipPrev) {
+                        transportButton("backward.fill", label: "Previous track", enabled: state.media.canSkipPrev) {
                             MediaController.shared.send(cmd: "prev")
                         }
-                        transportButton(state.media.playing ? "pause.fill" : "play.fill", enabled: true) {
+                        transportButton(
+                            state.media.playing ? "pause.fill" : "play.fill",
+                            label: state.media.playing ? "Pause" : "Play",
+                            enabled: true
+                        ) {
                             MediaController.shared.send(cmd: "toggle")
                         }
-                        transportButton("forward.fill", enabled: state.media.canSkipNext) {
+                        transportButton("forward.fill", label: "Next track", enabled: state.media.canSkipNext) {
                             MediaController.shared.send(cmd: "next")
                         }
                     }
@@ -244,12 +570,11 @@ struct MenuContent: View {
         let maxV = Double(state.media.maxVolume)
         let current = pendingVolume ?? Double(state.media.volume)
         return HStack(spacing: 8) {
-            Image(systemName: "speaker.fill").foregroundStyle(.secondary)
+            Image(systemName: "speaker.fill")
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
             Slider(
-                value: Binding(
-                    get: { current },
-                    set: { pendingVolume = $0 }
-                ),
+                value: Binding(get: { current }, set: { pendingVolume = $0 }),
                 in: 0...maxV, step: 1,
                 onEditingChanged: { editing in
                     if !editing, let v = pendingVolume {
@@ -257,13 +582,17 @@ struct MenuContent: View {
                     }
                 }
             )
-            Image(systemName: "speaker.wave.3.fill").foregroundStyle(.secondary)
+            .accessibilityLabel("Phone media volume")
+            .accessibilityValue("\(Int(current)) of \(Int(maxV))")
+            Image(systemName: "speaker.wave.3.fill")
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
         }
     }
 
     @ViewBuilder
     private var artworkView: some View {
-        let size: CGFloat = 48
+        let size: CGFloat = 46
         if let b64 = state.media.artworkBase64,
            let data = Data(base64Encoded: b64),
            let img = NSImage(data: data) {
@@ -273,38 +602,69 @@ struct MenuContent: View {
                 .scaledToFill()
                 .frame(width: size, height: size)
                 .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                .accessibilityHidden(true)
         } else {
             RoundedRectangle(cornerRadius: 6, style: .continuous)
                 .fill(Color.secondary.opacity(0.15))
                 .frame(width: size, height: size)
                 .overlay(Image(systemName: "music.note").foregroundStyle(.secondary))
+                .accessibilityHidden(true)
         }
     }
 
-    private func transportButton(_ systemName: String,
-                                 enabled: Bool,
-                                 action: @escaping () -> Void) -> some View {
+    private func transportButton(
+        _ systemName: String,
+        label: String,
+        enabled: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
         Button(action: action) {
             Image(systemName: systemName)
-                .font(.body)
+                .font(.caption)
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 2)
         }
         .buttonStyle(.bordered)
         .disabled(!enabled)
+        .help(label)
+        .accessibilityLabel(label)
     }
 
-    // MARK: - Clipboard toggle
+    // MARK: - Footer Strip
 
-    private var clipboardToggle: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Toggle("Clipboard sync", isOn: $prefs.clipboardSyncEnabled)
-                .toggleStyle(.switch)
-            if let dir = state.lastClipDirection, let at = state.lastClipAt {
-                Text("\(dir == .incoming ? "← from phone" : "→ to phone") • \(Self.relative(at))")
-                    .font(.caption).foregroundStyle(.secondary)
+    private var footerStrip: some View {
+        HStack(spacing: 4) {
+            footerButton("folder.fill", "Files", .files, "f")
+            footerButton("bell.badge.fill", "Inbox", .notifications, "n")
+            footerButton("gearshape.fill", "Settings", .settings, ",")
+            Spacer(minLength: 4)
+            Button(role: .destructive) { NSApp.terminate(nil) } label: {
+                Label("Quit", systemImage: "power")
+                    .font(.caption)
             }
+            .buttonStyle(.borderless)
+            .foregroundStyle(.secondary)
+            .keyboardShortcut("q")
+            .help("Quit NotifMirror (⌘Q)")
         }
+    }
+
+    private func footerButton(
+        _ symbol: String,
+        _ title: String,
+        _ section: MainSection,
+        _ shortcut: KeyEquivalent
+    ) -> some View {
+        Button {
+            openMain(section: section)
+        } label: {
+            Label(title, systemImage: symbol)
+                .font(.caption)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 3)
+        }
+        .buttonStyle(.borderless)
+        .keyboardShortcut(shortcut)
     }
 
     // MARK: - Helpers
@@ -315,89 +675,125 @@ struct MenuContent: View {
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    private func pickAndSendFile() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
-        NSApp.activate(ignoringOtherApps: true)
-        if panel.runModal() == .OK, let url = panel.url {
-            FileTransferCenter.shared.sendFile(url: url)
+    private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
+        guard canSendFiles else { return false }
+        var accepted = 0
+        for provider in providers where provider.canLoadObject(ofClass: URL.self) {
+            _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                guard let url else { return }
+                Task { @MainActor in
+                    FileTransferCenter.shared.sendFile(url: url)
+                }
+            }
+            accepted += 1
         }
+        return accepted > 0
     }
 
     private static func relative(_ date: Date) -> String {
         let f = RelativeDateTimeFormatter()
-        f.unitsStyle = .short
+        f.unitsStyle = .abbreviated
         return f.localizedString(for: date, relativeTo: Date())
-    }
-}
-
-private struct OptionalKeyboardShortcut: ViewModifier {
-    let key: KeyEquivalent?
-    func body(content: Content) -> some View {
-        if let key {
-            content.keyboardShortcut(key)
-        } else {
-            content
-        }
     }
 }
 
 private struct MenuRecentRow: View {
     let entry: NotificationHistory.Entry
+    let canReply: Bool
+    let showDeviceBadge: Bool
     let onOpen: () -> Void
-    @State private var copied = false
+
+    @State private var replying: Bool = false
+    @State private var replyText: String = ""
+    @State private var sentFlash: Bool = false
+
+    private var replyAction: ActionDescriptor? {
+        entry.actions?.first(where: \.isReply)
+    }
 
     var body: some View {
-        Button(action: onOpen) {
-            HStack(alignment: .top, spacing: 8) {
-                thumbnail
-                VStack(alignment: .leading, spacing: 1) {
-                    HStack(alignment: .firstTextBaseline) {
-                        Text(entry.app).font(.caption).foregroundStyle(.secondary)
-                            .lineLimit(1)
-                        Spacer(minLength: 4)
-                        Text(entry.receivedAt,
-                             format: .relative(presentation: .numeric, unitsStyle: .narrow))
-                            .font(.caption2).foregroundStyle(.tertiary)
-                    }
-                    Text(primaryText)
-                        .font(.caption)
-                        .lineLimit(2)
-                        .foregroundStyle(.primary)
-                    if let code = entry.extractedCode {
-                        Button {
-                            let pb = NSPasteboard.general
-                            pb.clearContents()
-                            pb.setString(code, forType: .string)
-                            copied = true
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) { copied = false }
-                        } label: {
-                            HStack(spacing: 4) {
-                                Image(systemName: copied ? "checkmark" : "doc.on.doc")
-                                    .font(.caption2)
-                                Text(copied ? "Copied" : code)
-                                    .font(.caption.weight(.medium))
-                                    .monospacedDigit()
-                            }
-                            .padding(.horizontal, 6).padding(.vertical, 2)
-                            .background(
-                                RoundedRectangle(cornerRadius: 5, style: .continuous)
-                                    .fill(Color.accentColor.opacity(0.15))
-                            )
-                            .foregroundStyle(Color.accentColor)
+        VStack(alignment: .leading, spacing: 4) {
+            Button(action: onOpen) {
+                HStack(alignment: .top, spacing: 8) {
+                    thumbnail
+                    VStack(alignment: .leading, spacing: 1) {
+                        HStack(alignment: .firstTextBaseline) {
+                            Text(showDeviceBadge && entry.deviceName != nil
+                                 ? "\(entry.app) • \(entry.deviceName!)"
+                                 : entry.app)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                            Spacer(minLength: 4)
+                            Text(entry.receivedAt,
+                                 format: .relative(presentation: .numeric, unitsStyle: .narrow))
+                                .font(.caption2).foregroundStyle(.tertiary)
                         }
-                        .buttonStyle(.plain)
-                        .padding(.top, 1)
+                        Text(primaryText)
+                            .font(.caption)
+                            .lineLimit(2)
+                            .foregroundStyle(.primary)
                     }
                 }
+                .padding(.horizontal, 6).padding(.vertical, 4)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
             }
-            .padding(.horizontal, 6).padding(.vertical, 4)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .contentShape(Rectangle())
+            .buttonStyle(.plain)
+            .accessibilityLabel("\(entry.app): \(primaryText)")
+
+            if entry.extractedCode != nil || (replyAction != nil && canReply) || sentFlash {
+                HStack(spacing: 6) {
+                    if let code = entry.extractedCode {
+                        CodeChip(code: code, compact: true)
+                    }
+                    if let action = replyAction, canReply {
+                        Button {
+                            replying.toggle()
+                            if !replying { replyText = "" }
+                        } label: {
+                            Label(replying ? "Close" : action.title, systemImage: "arrowshape.turn.up.left.fill")
+                                .font(.caption2.weight(.medium))
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                    }
+                    if sentFlash {
+                        Label("Sent", systemImage: "checkmark.circle.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.green)
+                    }
+                }
+                .padding(.leading, 42)
+            }
+
+            if replying, let action = replyAction, canReply {
+                HStack(spacing: 6) {
+                    TextField("Reply…", text: $replyText)
+                        .textFieldStyle(.roundedBorder)
+                        .controlSize(.small)
+                        .onSubmit { submitReply(action) }
+                    Button("Send") { submitReply(action) }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.mini)
+                        .disabled(replyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+                .padding(.leading, 42)
+                .padding(.trailing, 4)
+                .padding(.bottom, 2)
+            }
         }
-        .buttonStyle(.plain)
+    }
+
+    private func submitReply(_ action: ActionDescriptor) {
+        let trimmed = replyText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        if WsServer.shared.sendAction(key: entry.key, actionId: action.id, text: trimmed, to: entry.deviceId) {
+            replyText = ""
+            replying = false
+            sentFlash = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { sentFlash = false }
+        }
     }
 
     private var primaryText: String {
@@ -413,9 +809,10 @@ private struct MenuRecentRow: View {
            FileManager.default.fileExists(atPath: path),
            let img = NSImage(contentsOfFile: path) {
             Image(nsImage: img)
-                .resizable().aspectRatio(contentMode: .fill)
+                .resizable().scaledToFill()
                 .frame(width: 28, height: 28)
                 .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+                .accessibilityHidden(true)
         } else {
             ZStack {
                 RoundedRectangle(cornerRadius: 5, style: .continuous)
@@ -423,6 +820,7 @@ private struct MenuRecentRow: View {
                 Image(systemName: "bell.fill").font(.caption2).foregroundStyle(.secondary)
             }
             .frame(width: 28, height: 28)
+            .accessibilityHidden(true)
         }
     }
 }

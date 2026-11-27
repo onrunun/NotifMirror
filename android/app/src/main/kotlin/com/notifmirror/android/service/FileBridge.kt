@@ -34,7 +34,10 @@ data class TransferEntry(
     val size: Long,
     val bytesTransferred: Long,
     val status: Status,
-    val updatedAt: Long
+    val updatedAt: Long,
+    val openUri: Uri? = null,
+    val sourceUri: Uri? = null,
+    val errorMessage: String? = null
 ) {
     enum class Direction { Incoming, Outgoing }
     enum class Status { Pending, Active, Done, Failed, Cancelled }
@@ -103,12 +106,60 @@ class FileBridge(private val context: Context) {
         outgoing.clear()
     }
 
+    fun cancel(xid: String) {
+        MirrorCore.cancelBulk(xid)
+        val inc = incoming.remove(xid)
+        if (inc != null) {
+            RadioKeepAlive.end()
+            runCatching { inc.outputStream.close() }
+            inc.tempFile?.delete()
+            upsert(
+                TransferEntry(
+                    id = xid,
+                    direction = TransferEntry.Direction.Incoming,
+                    name = inc.name,
+                    size = inc.size,
+                    bytesTransferred = inc.received,
+                    status = TransferEntry.Status.Cancelled,
+                    updatedAt = System.currentTimeMillis()
+                )
+            )
+            MirrorCore.dispatch(WireMessage.FileCancel(xid, "user_cancelled"))
+            return
+        }
+        val out = outgoing.remove(xid)
+        if (out != null) {
+            out.cancelled = true
+            upsertProgress(out, out.offset, TransferEntry.Status.Cancelled)
+            MirrorCore.dispatch(WireMessage.FileCancel(xid, "user_cancelled"))
+        }
+    }
+
+    fun retry(xid: String): Boolean {
+        val prev = _transfers.value.firstOrNull {
+            it.id == xid && it.direction == TransferEntry.Direction.Outgoing && it.sourceUri != null
+        } ?: return false
+        val uri = prev.sourceUri ?: return false
+        _transfers.update { list -> list.filterNot { it.id == xid } }
+        sendFile(uri, prev.name, prev.size)
+        return true
+    }
+
+    fun buildOpenIntent(entry: TransferEntry): Intent? {
+        val uri = entry.openUri ?: return null
+        val mime = guessMime(entry.name) ?: "*/*"
+        return Intent(Intent.ACTION_VIEW).apply {
+            flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK
+            setDataAndType(uri, mime)
+        }
+    }
+
     // ───────────────────────────────────────── Incoming (Mac → Android)
 
     private fun onOffer(offer: WireMessage.FileOffer) {
         try {
             val (uri, temp, os) = openDownloadsSink(offer.name)
-            incoming[offer.xid] = Incoming(
+            val state = Incoming(
                 name = offer.name,
                 size = offer.size,
                 uri = uri,
@@ -116,6 +167,7 @@ class FileBridge(private val context: Context) {
                 outputStream = os,
                 received = 0
             )
+            incoming[offer.xid] = state
             upsert(
                 TransferEntry(
                     id = offer.xid,
@@ -127,9 +179,63 @@ class FileBridge(private val context: Context) {
                     updatedAt = System.currentTimeMillis()
                 )
             )
-            // Keep the Wi-Fi radio active during the incoming transfer so AP→
-            // phone chunks aren't stuck in DTIM buffers. Balanced in onDone /
-            // failIncoming / onIncomingCancel.
+            val bulk = MirrorCore.bulkEndpoint()
+            if (bulk != null) {
+                MirrorCore.dispatch(WireMessage.FileAccept(offer.xid))
+                Thread({
+                    MirrorCore.beginFileTransfer()
+                    try {
+                        val copied = bulk.client.downloadToStream(
+                            host = bulk.host,
+                            port = bulk.port,
+                            secret = bulk.secret,
+                            id = offer.xid,
+                            out = state.outputStream
+                        ) { bytes ->
+                            state.received = bytes
+                            upsert(
+                                TransferEntry(
+                                    id = offer.xid,
+                                    direction = TransferEntry.Direction.Incoming,
+                                    name = state.name,
+                                    size = state.size,
+                                    bytesTransferred = bytes,
+                                    status = TransferEntry.Status.Active,
+                                    updatedAt = System.currentTimeMillis()
+                                )
+                            )
+                        }
+                        state.received = copied
+                        val finished = incoming.remove(offer.xid) ?: return@Thread
+                        runCatching { finished.outputStream.close() }
+                        val ok = finished.size <= 0 || finished.received == finished.size
+                        val err = if (ok) null else "size_mismatch"
+                        if (ok) notifyArrived(finished)
+                        upsert(
+                            TransferEntry(
+                                id = offer.xid,
+                                direction = TransferEntry.Direction.Incoming,
+                                name = finished.name,
+                                size = finished.size,
+                                bytesTransferred = finished.received,
+                                status = if (ok) TransferEntry.Status.Done else TransferEntry.Status.Failed,
+                                updatedAt = System.currentTimeMillis(),
+                                openUri = if (ok) resolveOpenUri(finished) else null,
+                                errorMessage = err
+                            )
+                        )
+                        MirrorCore.dispatch(WireMessage.FileAck(offer.xid, ok, err))
+                    } catch (e: Throwable) {
+                        Log.w(TAG, "bulk file download failed xid=${offer.xid}", e)
+                        if (incoming.containsKey(offer.xid)) {
+                            failIncoming(offer.xid, "io_error")
+                        }
+                    } finally {
+                        MirrorCore.endFileTransfer()
+                    }
+                }, "file-bulk-in-${offer.xid}").start()
+                return
+            }
             RadioKeepAlive.begin()
             MirrorCore.dispatch(WireMessage.FileAccept(offer.xid))
         } catch (e: Throwable) {
@@ -195,6 +301,7 @@ class FileBridge(private val context: Context) {
             failIncoming(done.xid, "io_error"); return
         }
         if (ok) notifyArrived(s)
+        val openUri = if (ok) resolveOpenUri(s) else null
         upsert(
             TransferEntry(
                 id = done.xid,
@@ -203,10 +310,25 @@ class FileBridge(private val context: Context) {
                 size = s.size,
                 bytesTransferred = s.received,
                 status = if (ok) TransferEntry.Status.Done else TransferEntry.Status.Failed,
-                updatedAt = System.currentTimeMillis()
+                updatedAt = System.currentTimeMillis(),
+                openUri = openUri,
+                errorMessage = err
             )
         )
         MirrorCore.dispatch(WireMessage.FileAck(done.xid, ok, err))
+    }
+
+    private fun resolveOpenUri(s: Incoming): Uri? = when {
+        s.uri != null -> s.uri
+        s.tempFile != null -> try {
+            FileProvider.getUriForFile(
+                context, "${context.packageName}.fileprovider", s.tempFile
+            )
+        } catch (e: Throwable) {
+            Log.w(TAG, "FileProvider failed", e)
+            null
+        }
+        else -> null
     }
 
     private fun notifyArrived(s: Incoming) {
@@ -296,7 +418,8 @@ class FileBridge(private val context: Context) {
                 size = s.size,
                 bytesTransferred = s.received,
                 status = TransferEntry.Status.Failed,
-                updatedAt = System.currentTimeMillis()
+                updatedAt = System.currentTimeMillis(),
+                errorMessage = reason
             )
         )
         MirrorCore.dispatch(WireMessage.FileCancel(xid, reason))
@@ -358,7 +481,8 @@ class FileBridge(private val context: Context) {
                 size = size,
                 bytesTransferred = 0,
                 status = TransferEntry.Status.Pending,
-                updatedAt = System.currentTimeMillis()
+                updatedAt = System.currentTimeMillis(),
+                sourceUri = uri
             )
         )
         MirrorCore.dispatch(
@@ -379,7 +503,8 @@ class FileBridge(private val context: Context) {
                 size = s.size,
                 bytesTransferred = 0,
                 status = TransferEntry.Status.Active,
-                updatedAt = System.currentTimeMillis()
+                updatedAt = System.currentTimeMillis(),
+                sourceUri = s.uri
             )
         )
         // Pump from a background thread so the socket stays responsive.
@@ -396,7 +521,8 @@ class FileBridge(private val context: Context) {
                 size = s.size,
                 bytesTransferred = s.offset,
                 status = TransferEntry.Status.Cancelled,
-                updatedAt = System.currentTimeMillis()
+                updatedAt = System.currentTimeMillis(),
+                sourceUri = s.uri
             )
         )
     }
@@ -411,13 +537,45 @@ class FileBridge(private val context: Context) {
                 size = s.size,
                 bytesTransferred = s.offset,
                 status = if (ack.ok) TransferEntry.Status.Done else TransferEntry.Status.Failed,
-                updatedAt = System.currentTimeMillis()
+                updatedAt = System.currentTimeMillis(),
+                sourceUri = s.uri,
+                errorMessage = if (ack.ok) null else ack.error
             )
         )
     }
 
     private fun pump(s: Outgoing) {
         val resolver = context.contentResolver
+        val bulk = MirrorCore.bulkEndpoint()
+        if (bulk != null && s.size >= 0L) {
+            MirrorCore.beginFileTransfer()
+            try {
+                bulk.client.uploadStream(
+                    host = bulk.host,
+                    port = bulk.port,
+                    secret = bulk.secret,
+                    id = s.xid,
+                    contentLength = s.size,
+                    openInput = { resolver.openInputStream(s.uri) }
+                ) { sent ->
+                    s.offset = sent
+                    upsertProgress(s, sent, TransferEntry.Status.Active)
+                }
+                if (!s.cancelled) {
+                    upsertProgress(s, s.offset, TransferEntry.Status.Done)
+                }
+            } catch (e: Throwable) {
+                Log.w(TAG, "bulk upload failed xid=${s.xid}", e)
+                if (!s.cancelled) {
+                    upsertProgress(s, s.offset, TransferEntry.Status.Failed)
+                    MirrorCore.dispatch(WireMessage.FileCancel(s.xid, "io_error"))
+                }
+                outgoing.remove(s.xid)
+            } finally {
+                MirrorCore.endFileTransfer()
+            }
+            return
+        }
         RadioKeepAlive.begin()
         try {
             resolver.openInputStream(s.uri)?.use { input ->
@@ -480,7 +638,8 @@ class FileBridge(private val context: Context) {
                 size = s.size,
                 bytesTransferred = transferred,
                 status = status,
-                updatedAt = System.currentTimeMillis()
+                updatedAt = System.currentTimeMillis(),
+                sourceUri = s.uri
             )
         )
     }
@@ -500,5 +659,13 @@ class FileBridge(private val context: Context) {
         /** Live + recently-finished transfers, newest first, for the app UI. */
         private val _transfers = MutableStateFlow<List<TransferEntry>>(emptyList())
         val transfers: StateFlow<List<TransferEntry>> = _transfers.asStateFlow()
+
+        fun clearFinished() {
+            _transfers.update { list ->
+                list.filter {
+                    it.status == TransferEntry.Status.Active || it.status == TransferEntry.Status.Pending
+                }
+            }
+        }
     }
 }

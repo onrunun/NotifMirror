@@ -54,21 +54,49 @@ final class ClipboardSync {
         // clip, don't bounce it back.
         if h == lastWrittenHash { return }
 
+        guard WsServer.shared.isClientAuthed else { return }
         outboundSeq &+= 1
-        WsServer.shared.send(.clip(text: text, origin: "mac", seq: outboundSeq))
+        WsServer.shared.broadcast(.clip(text: text, origin: "mac", seq: outboundSeq), requiringFeature: "clip")
         AppState.shared.lastClipDirection = .outgoing
         AppState.shared.lastClipAt = Date()
+        AppState.shared.recordClip(text, direction: .outgoing)
     }
 
-    func handleRemoteClip(text: String, origin: String, seq: Int) {
+    /// One-off send from the Clipboard Hub or Control Center. Works even when
+    /// continuous automatic clipboard sync is turned off.
+    @discardableResult
+    func sendManualText(_ text: String, to deviceId: String? = nil) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, text.utf8.count <= textCap, WsServer.shared.isClientAuthed else {
+            return false
+        }
+        outboundSeq &+= 1
+        let targetName = AppState.shared.device(id: deviceId)?.name
+        WsServer.shared.send(.clip(text: text, origin: "mac", seq: outboundSeq), to: deviceId)
+        AppState.shared.lastClipDirection = .outgoing
+        AppState.shared.lastClipAt = Date()
+        AppState.shared.recordClip(text, direction: .outgoing, deviceName: targetName)
+        return true
+    }
+
+    /// Copy text from the in-memory clipboard history back onto the local
+    /// pasteboard without triggering an outbound echo to the phone.
+    func copyToLocalPasteboard(_ text: String) {
+        lastWrittenHash = Self.sha256(text)
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+        lastChangeCount = pasteboard.changeCount
+    }
+
+    func handleRemoteClip(text: String, origin: String, seq: Int, deviceName: String? = nil) {
         guard Preferences.shared.clipboardSyncEnabled else {
             // Don't drop silently — hold the text and say so.
             pendingRemoteClipText = text
-            postArrivalNotification(text: text, syncDisabled: true)
+            postArrivalNotification(text: text, syncDisabled: true, deviceName: deviceName)
             return
         }
-        writeIncoming(text)
-        postArrivalNotification(text: text, syncDisabled: false)
+        writeIncoming(text, deviceName: deviceName)
+        postArrivalNotification(text: text, syncDisabled: false, deviceName: deviceName)
     }
 
     /// Banner tap action for a clip that arrived while sync was off: turn
@@ -77,10 +105,10 @@ final class ClipboardSync {
         guard let text = pendingRemoteClipText else { return }
         pendingRemoteClipText = nil
         Preferences.shared.clipboardSyncEnabled = true
-        writeIncoming(text)
+        writeIncoming(text, deviceName: nil)
     }
 
-    private func writeIncoming(_ text: String) {
+    private func writeIncoming(_ text: String, deviceName: String?) {
         lastWrittenHash = Self.sha256(text)
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
@@ -89,10 +117,13 @@ final class ClipboardSync {
         lastChangeCount = pasteboard.changeCount
         AppState.shared.lastClipDirection = .incoming
         AppState.shared.lastClipAt = Date()
+        AppState.shared.recordClip(text, direction: .incoming, deviceName: deviceName)
     }
 
-    private func postArrivalNotification(text: String, syncDisabled: Bool) {
+    private func postArrivalNotification(text: String, syncDisabled: Bool, deviceName: String?) {
+        if AppState.shared.isMirroringPaused { return }
         let center = UNUserNotificationCenter.current()
+        let sender = deviceName ?? "phone"
         Task {
             // The launch-time prompt often never surfaces for LSUIElement
             // apps — ask here if it was never determined.
@@ -103,9 +134,9 @@ final class ClipboardSync {
             let content = UNMutableNotificationContent()
             if syncDisabled {
                 content.title = "Clipboard sync is off"
-                content.body = "Tap to copy the text from your phone: \(Self.preview(of: text))"
+                content.body = "Tap to copy text from \(sender): \(Self.preview(of: text))"
             } else {
-                content.title = "Text received from phone"
+                content.title = "Text received from \(sender)"
                 content.body = Self.preview(of: text)
             }
             content.sound = .default

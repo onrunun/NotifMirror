@@ -1,54 +1,76 @@
+import AppKit
 import Foundation
 
-/// Diagnostic file logger. NSLog output from dynamically-loaded Swift apps
-/// doesn't always land in the unified log the way you'd expect, so while
-/// we're chasing the Wi-Fi pull stall we write straight to a flat file at
-/// /tmp/notifmirror.log for easy tailing.
+/// Opt-in, debug-only diagnostic file logger.
+///
+/// Strictly compiled out in Release builds so file paths and frame telemetry
+/// are never written to disk. In Debug builds, opt in via
+/// `defaults write com.notifmirror.app debugFileLogging -bool YES`; logs write
+/// into the user-private Caches directory (mode 0600, capped at 2 MiB) rather
+/// than world-readable `/tmp`.
 enum DebugLog {
-    private static let path = "/tmp/notifmirror.log"
+    #if DEBUG
+    private static let maxBytes: UInt64 = 2 * 1024 * 1024
+    private static let enabled = UserDefaults.standard.bool(forKey: "debugFileLogging")
+    private static let fileURL: URL? = {
+        guard let caches = FileManager.default.urls(
+            for: .cachesDirectory, in: .userDomainMask
+        ).first else { return nil }
+        let dir = caches.appendingPathComponent("NotifMirror", isDirectory: true)
+        try? FileManager.default.createDirectory(
+            at: dir,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        return dir.appendingPathComponent("debug.log")
+    }()
     private static let fmt: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "HH:mm:ss.SSS"
         return f
     }()
     private static let queue = DispatchQueue(label: "com.notifmirror.app.debuglog")
+    #endif
 
     static func line(_ message: String) {
+        #if DEBUG
+        guard enabled, let url = fileURL else { return }
         let stamped = "\(fmt.string(from: Date())) \(message)\n"
         queue.async {
-            if let data = stamped.data(using: .utf8) {
-                if let fh = FileHandle(forWritingAtPath: path) {
-                    _ = try? fh.seekToEnd()
-                    try? fh.write(contentsOf: data)
-                    try? fh.close()
-                } else {
-                    try? data.write(to: URL(fileURLWithPath: path))
-                }
+            guard let data = stamped.data(using: .utf8) else { return }
+            let fm = FileManager.default
+            if let attrs = try? fm.attributesOfItem(atPath: url.path),
+               let size = attrs[.size] as? UInt64,
+               size >= maxBytes {
+                try? fm.removeItem(at: url)
+            }
+            if !fm.fileExists(atPath: url.path) {
+                fm.createFile(
+                    atPath: url.path,
+                    contents: data,
+                    attributes: [.posixPermissions: 0o600]
+                )
+            } else if let fh = try? FileHandle(forWritingTo: url) {
+                _ = try? fh.seekToEnd()
+                try? fh.write(contentsOf: data)
+                try? fh.close()
             }
         }
+        #endif
     }
 }
 
-/// Browses / reads / writes the paired phone's filesystem over the existing
-/// WebSocket. Used when the phone advertises the `fsbrowse` feature; otherwise
-/// the app falls back to `AdbClient`.
-///
-/// Every public method is async and correlates a request with its response(s)
-/// via a `reqId` (8 random hex chars). In-flight ops are tracked in
-/// `pendingOps`; `WsServer` calls `deliver(_:)` for each inbound `fs_*` frame.
+/// Browses / reads / writes a paired phone's filesystem over the WebSocket
+/// control channel + `BulkTransferServer` (TLS HTTP/1.1 streaming for fast
+/// file reads/writes, with seamless WS binary fallback for older peers).
 @MainActor
 final class ProtocolFileClient {
     static let shared = ProtocolFileClient()
 
     private init() {}
 
-    private static let chunkSize: Int = 256 * 1024
+    private nonisolated static let chunkSize: Int = 256 * 1024
 
-    /// Serial background queue for base64-decoding incoming `fs_chunk`
-    /// payloads and writing them to disk. Keeps the heavy work off the
-    /// main actor so the pull can keep up with Android's 256 KiB chunk
-    /// stream even while other main-actor work (folder-size analyze,
-    /// SwiftUI rendering, etc.) is in flight.
     private static let chunkWriteQueue = DispatchQueue(
         label: "com.notifmirror.app.fsChunkWrite",
         qos: .userInitiated
@@ -56,105 +78,239 @@ final class ProtocolFileClient {
 
     // MARK: - Pending op tracking
 
-    /// One in-flight op's continuations + state. Only one kind is active per
-    /// `reqId`, so we use a single struct with all optional slots.
     private final class Pending {
-        // Simple RPCs (list/delete/mkdir/disk) — resolved by one response.
+        var deviceId: String? = nil
+        var usesBulkHttp: Bool = false
+
         var resumeList: CheckedContinuation<([WireMessage.FsEntry], String?), Error>? = nil
         var resumeOp: CheckedContinuation<Void, Error>? = nil
         var resumeDisk: CheckedContinuation<(Int64, Int64), Error>? = nil
         var resumeDu: CheckedContinuation<DiskUsageReport, Error>? = nil
+        var resumeThumb: CheckedContinuation<Data, Error>? = nil
 
-        // Read: header → many chunks → last chunk. We write chunks to a
-        // FileHandle as they arrive, report progress, and resume `resumeRead`
-        // when `last=true` is seen.
         var resumeRead: CheckedContinuation<Void, Error>? = nil
         var readHandle: FileHandle? = nil
         var readExpectedSize: Int64 = 0
         var readBytesSoFar: Int64 = 0
         var readProgress: ((Double) -> Void)? = nil
         var lastProgressAt: CFAbsoluteTime = 0
-        /// Time of the last chunk received (or start of pull). Used by the
-        /// watchdog in `pull()` to detect stalls and fail the transfer.
         var lastChunkAt: CFAbsoluteTime = 0
 
-        // Write: wait for `fs_write_ready`, stream chunks, wait for final
-        // `fs_op_result{ok}`. Between ready and op_result, the sending loop
-        // owns the flow — we stash the URL and progress handler so the loop
-        // can run after `resumeWriteReady` fires.
         var resumeWriteReady: CheckedContinuation<Void, Error>? = nil
         var resumeWriteDone: CheckedContinuation<Void, Error>? = nil
     }
 
     private var pending: [String: Pending] = [:]
+    private var cancelledReqs: Set<String> = []
 
-    // MARK: - Public API
+    /// Bounded in-memory LRU thumbnail cache keyed by `"<deviceId>:<path>@<mtime>"`.
+    private let thumbCache: NSCache<NSString, NSImage> = {
+        let c = NSCache<NSString, NSImage>()
+        c.countLimit = 300
+        return c
+    }()
+
+    /// Off-main storage for legacy WS binary chunks so incoming bytes write
+    /// sequentially on `chunkWriteQueue` without bouncing through `@MainActor`.
+    private nonisolated(unsafe) static var legacyHandles: [String: FileHandle] = [:]
 
     struct FsError: LocalizedError {
         let message: String
         var errorDescription: String? { message }
     }
 
-    func list(path: String) async throws -> [AdbEntry] {
+    private func resolveDeviceId(_ explicit: String?) -> String? {
+        explicit ?? AppState.shared.activeDeviceId
+    }
+
+    private func canUseBulkHttp(for deviceId: String?) -> Bool {
+        guard BulkTransferServer.shared.port > 0,
+              let dev = AppState.shared.device(id: deviceId) else {
+            return false
+        }
+        return dev.features.contains("httpbulk")
+    }
+
+    // MARK: - Thumbnails
+
+    func cachedThumbnail(for key: String) -> NSImage? {
+        thumbCache.object(forKey: key as NSString)
+    }
+
+    func thumbnailImage(
+        path: String,
+        cacheKey: String,
+        deviceId: String? = nil,
+        maxDim: Int = 240
+    ) async throws -> NSImage {
+        if let hit = thumbCache.object(forKey: cacheKey as NSString) {
+            return hit
+        }
+        let data = try await thumbnail(path: path, deviceId: deviceId, maxDim: maxDim)
+        guard let image = NSImage(data: data) else {
+            throw FsError(message: "invalid thumbnail image")
+        }
+        thumbCache.setObject(image, forKey: cacheKey as NSString)
+        return image
+    }
+
+    func thumbnail(path: String, deviceId: String? = nil, maxDim: Int = 240) async throws -> Data {
         let reqId = Self.makeReqId()
+        let target = resolveDeviceId(deviceId)
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Data, Error>) in
+                if Task.isCancelled {
+                    cont.resume(throwing: CancellationError())
+                    return
+                }
+                let slot = Pending()
+                slot.deviceId = target
+                slot.resumeThumb = cont
+                pending[reqId] = slot
+                WsServer.shared.send(.fsThumb(reqId: reqId, path: path, maxDim: maxDim), to: target)
+            }
+        } onCancel: {
+            Task { @MainActor in
+                if let slot = ProtocolFileClient.shared.pending.removeValue(forKey: reqId) {
+                    let cont = slot.resumeThumb
+                    slot.resumeThumb = nil
+                    cont?.resume(throwing: CancellationError())
+                }
+            }
+        }
+    }
+
+    // MARK: - Metadata RPCs
+
+    func list(path: String, deviceId: String? = nil) async throws -> [AdbEntry] {
+        let reqId = Self.makeReqId()
+        let target = resolveDeviceId(deviceId)
         let result: ([WireMessage.FsEntry], String?) = try await withCheckedThrowingContinuation { cont in
             let slot = Pending()
+            slot.deviceId = target
             slot.resumeList = cont
             pending[reqId] = slot
-            WsServer.shared.send(.fsList(reqId: reqId, path: path))
+            WsServer.shared.send(.fsList(reqId: reqId, path: path), to: target)
         }
-        if let err = result.1 {
-            throw FsError(message: err)
-        }
+        if let err = result.1 { throw FsError(message: err) }
         return result.0.map { Self.toAdbEntry($0) }
     }
 
-    func delete(path: String) async throws {
-        try await opCall { reqId in .fsDelete(reqId: reqId, path: path) }
+    func delete(path: String, deviceId: String? = nil) async throws {
+        try await opCall(deviceId: deviceId) { reqId in .fsDelete(reqId: reqId, path: path) }
     }
 
-    func mkdir(path: String) async throws {
-        try await opCall { reqId in .fsMkdir(reqId: reqId, path: path) }
+    func mkdir(path: String, deviceId: String? = nil) async throws {
+        try await opCall(deviceId: deviceId) { reqId in .fsMkdir(reqId: reqId, path: path) }
     }
 
-    func rename(from: String, to: String) async throws {
-        try await opCall { reqId in .fsRename(reqId: reqId, from: from, to: to) }
+    func rename(from: String, to: String, deviceId: String? = nil) async throws {
+        try await opCall(deviceId: deviceId) { reqId in .fsRename(reqId: reqId, from: from, to: to) }
     }
 
-    func diskUsage(path: String) async throws -> (free: Int64, total: Int64) {
+    func diskUsage(path: String, deviceId: String? = nil) async throws -> (free: Int64, total: Int64) {
         let reqId = Self.makeReqId()
+        let target = resolveDeviceId(deviceId)
         let pair: (Int64, Int64) = try await withCheckedThrowingContinuation { cont in
             let slot = Pending()
+            slot.deviceId = target
             slot.resumeDisk = cont
             pending[reqId] = slot
-            WsServer.shared.send(.fsDisk(reqId: reqId, path: path))
+            WsServer.shared.send(.fsDisk(reqId: reqId, path: path), to: target)
         }
         return (free: pair.0, total: pair.1)
     }
 
-    /// Walks `path` recursively on the phone and returns per-immediate-child
-    /// totals. Slow on big roots like `/sdcard` (seconds, sometimes tens of
-    /// seconds) — callers should show a spinner.
-    func diskAnalyze(path: String) async throws -> DiskUsageReport {
+    func diskAnalyze(path: String, deviceId: String? = nil) async throws -> DiskUsageReport {
         let reqId = Self.makeReqId()
+        let target = resolveDeviceId(deviceId)
         return try await withCheckedThrowingContinuation { cont in
             let slot = Pending()
+            slot.deviceId = target
             slot.resumeDu = cont
             pending[reqId] = slot
-            WsServer.shared.send(.fsDu(reqId: reqId, path: path))
+            WsServer.shared.send(.fsDu(reqId: reqId, path: path), to: target)
         }
     }
+
+    // MARK: - Pull (Phone → Mac)
 
     func pull(
         remote: String,
         to local: URL,
+        deviceId: String? = nil,
         onProgress: ((Double) -> Void)? = nil
     ) async throws {
-        let reqId = Self.makeReqId()
-        DebugLog.line("[fspull] start reqId=\(reqId) remote=\(remote)")
+        let target = resolveDeviceId(deviceId)
+        if canUseBulkHttp(for: target) {
+            try await pullViaBulkHttp(remote: remote, to: local, deviceId: target, onProgress: onProgress)
+            return
+        }
+        try await pullViaLegacyWs(remote: remote, to: local, deviceId: target, onProgress: onProgress)
+    }
 
-        // Prepare destination. Open for writing before sending fs_read so
-        // chunks that arrive fast have a handle ready.
+    private func pullViaBulkHttp(
+        remote: String,
+        to local: URL,
+        deviceId: String?,
+        onProgress: ((Double) -> Void)?
+    ) async throws {
+        let reqId = Self.makeReqId()
+        let slot = Pending()
+        slot.deviceId = deviceId
+        slot.usesBulkHttp = true
+        slot.readProgress = onProgress
+        pending[reqId] = slot
+
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                if Task.isCancelled {
+                    pending.removeValue(forKey: reqId)
+                    cont.resume(throwing: CancellationError())
+                    return
+                }
+                slot.resumeRead = cont
+                BulkTransferServer.shared.registerUpload(
+                    id: reqId,
+                    destination: local,
+                    expectedSize: 0,
+                    onProgress: { bytes, total in
+                        guard let onProgress else { return }
+                        let pct = total > 0 ? min(1.0, Double(bytes) / Double(total)) : 0
+                        Task { @MainActor in onProgress(pct) }
+                    },
+                    onComplete: { result in
+                        Task { @MainActor in
+                            guard let active = ProtocolFileClient.shared.pending.removeValue(forKey: reqId) else {
+                                return
+                            }
+                            let c = active.resumeRead
+                            active.resumeRead = nil
+                            switch result {
+                            case .success:
+                                c?.resume()
+                            case let .failure(err):
+                                c?.resume(throwing: err)
+                            }
+                        }
+                    }
+                )
+                WsServer.shared.send(.fsRead(reqId: reqId, path: remote), to: deviceId)
+            }
+        } onCancel: {
+            Task { @MainActor in
+                ProtocolFileClient.shared.cancelPull(reqId: reqId)
+            }
+        }
+    }
+
+    private func pullViaLegacyWs(
+        remote: String,
+        to local: URL,
+        deviceId: String?,
+        onProgress: ((Double) -> Void)?
+    ) async throws {
+        let reqId = Self.makeReqId()
         let fm = FileManager.default
         try? fm.removeItem(at: local)
         fm.createFile(atPath: local.path, contents: nil)
@@ -163,65 +319,137 @@ final class ProtocolFileClient {
         }
 
         let slot = Pending()
+        slot.deviceId = deviceId
         slot.readHandle = handle
         slot.readProgress = onProgress
         slot.lastChunkAt = CFAbsoluteTimeGetCurrent()
         pending[reqId] = slot
-
-        // Watchdog: the old 60 s threshold was too aggressive — real-world
-        // Wi-Fi routinely goes 60–90 s quiet between radio wake cycles and
-        // then resumes happily. Killing the transfer at 60 s meant we
-        // abandoned transfers that would have completed a few seconds later,
-        // and because the phone never heard about it, it kept pumping chunks
-        // into a nonexistent pending slot ("unknown reqId" storm in the log).
-        // 5 minutes is far more forgiving; if the link is truly dead, TCP
-        // keep-alive will close the socket and peerDisconnected fires anyway.
-        let watchdog = Task { [reqId] in
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 10_000_000_000)
-                if Task.isCancelled { return }
-                await MainActor.run {
-                    guard let slot = ProtocolFileClient.shared.pending[reqId] else { return }
-                    let age = CFAbsoluteTimeGetCurrent() - slot.lastChunkAt
-                    if age > 300 {
-                        DebugLog.line("[fspull] watchdog timeout reqId=\(reqId) ageSinceLastChunk=\(Int(age))s")
-                        ProtocolFileClient.shared.pending.removeValue(forKey: reqId)
-                        // Tell the phone to stop pumping; otherwise its
-                        // read-ahead will keep firing chunks for a reqId that
-                        // no longer exists here, burning the Wi-Fi link.
-                        WsServer.shared.send(.fsCancel(reqId: reqId, reason: "mac_watchdog_timeout"))
-                        slot.resumeRead?.resume(throwing: FsError(
-                            message: "Transfer stalled (no chunks for 5 min). Retry, or switch to adb mode."
-                        ))
-                    }
-                }
-            }
-        }
+        Self.chunkWriteQueue.async { Self.legacyHandles[reqId] = handle }
 
         do {
-            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-                slot.resumeRead = cont
-                WsServer.shared.send(.fsRead(reqId: reqId, path: remote))
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                    if Task.isCancelled {
+                        pending.removeValue(forKey: reqId)
+                        cont.resume(throwing: CancellationError())
+                        return
+                    }
+                    slot.resumeRead = cont
+                    WsServer.shared.send(.fsRead(reqId: reqId, path: remote), to: deviceId)
+                }
+            } onCancel: {
+                Task { @MainActor in
+                    ProtocolFileClient.shared.cancelPull(reqId: reqId)
+                }
             }
-            watchdog.cancel()
-            DebugLog.line("[fspull] done reqId=\(reqId) bytes=\(slot.readBytesSoFar)/\(slot.readExpectedSize)")
         } catch {
-            watchdog.cancel()
-            DebugLog.line("[fspull] failed reqId=\(reqId) err=\(error)")
-            try? handle.close()
+            Self.chunkWriteQueue.async {
+                if let h = Self.legacyHandles.removeValue(forKey: reqId) { try? h.close() }
+            }
             try? fm.removeItem(at: local)
             pending.removeValue(forKey: reqId)
             throw error
         }
 
-        try? handle.close()
+        Self.chunkWriteQueue.async {
+            if let h = Self.legacyHandles.removeValue(forKey: reqId) { try? h.close() }
+        }
         pending.removeValue(forKey: reqId)
     }
+
+    private func cancelPull(reqId: String) {
+        guard let slot = pending.removeValue(forKey: reqId) else { return }
+        if slot.usesBulkHttp {
+            BulkTransferServer.shared.cancel(id: reqId)
+        }
+        if cancelledReqs.insert(reqId).inserted {
+            WsServer.shared.send(.fsCancel(reqId: reqId, reason: "user_cancelled"), to: slot.deviceId)
+        }
+        let cont = slot.resumeRead
+        slot.resumeRead = nil
+        cont?.resume(throwing: CancellationError())
+    }
+
+    // MARK: - Push (Mac → Phone)
 
     func push(
         local: URL,
         to remotePath: String,
+        deviceId: String? = nil,
         onProgress: ((Double) -> Void)? = nil
+    ) async throws {
+        let target = resolveDeviceId(deviceId)
+        if canUseBulkHttp(for: target) {
+            try await pushViaBulkHttp(local: local, to: remotePath, deviceId: target, onProgress: onProgress)
+            return
+        }
+        try await pushViaLegacyWs(local: local, to: remotePath, deviceId: target, onProgress: onProgress)
+    }
+
+    private func pushViaBulkHttp(
+        local: URL,
+        to remotePath: String,
+        deviceId: String?,
+        onProgress: ((Double) -> Void)?
+    ) async throws {
+        let reqId = Self.makeReqId()
+        let attrs = (try? FileManager.default.attributesOfItem(atPath: local.path)) ?? [:]
+        let size = (attrs[.size] as? NSNumber)?.int64Value ?? 0
+
+        let slot = Pending()
+        slot.deviceId = deviceId
+        slot.usesBulkHttp = true
+        pending[reqId] = slot
+
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                if Task.isCancelled {
+                    pending.removeValue(forKey: reqId)
+                    cont.resume(throwing: CancellationError())
+                    return
+                }
+                slot.resumeWriteDone = cont
+                BulkTransferServer.shared.registerDownload(
+                    id: reqId,
+                    source: local,
+                    onProgress: { sent, total in
+                        guard let onProgress else { return }
+                        let pct = total > 0 ? min(1.0, Double(sent) / Double(total)) : 1.0
+                        Task { @MainActor in onProgress(pct) }
+                    },
+                    onComplete: { result in
+                        if case let .failure(err) = result {
+                            Task { @MainActor in
+                                guard let active = ProtocolFileClient.shared.pending.removeValue(forKey: reqId) else {
+                                    return
+                                }
+                                let c = active.resumeWriteDone
+                                active.resumeWriteDone = nil
+                                c?.resume(throwing: err)
+                            }
+                        }
+                    }
+                )
+                WsServer.shared.send(.fsWrite(reqId: reqId, path: remotePath, size: size), to: deviceId)
+            }
+        } onCancel: {
+            Task { @MainActor in
+                if let active = ProtocolFileClient.shared.pending.removeValue(forKey: reqId) {
+                    BulkTransferServer.shared.cancel(id: reqId)
+                    WsServer.shared.send(.fsCancel(reqId: reqId, reason: "user_cancelled"), to: active.deviceId)
+                    let c = active.resumeWriteDone
+                    active.resumeWriteDone = nil
+                    c?.resume(throwing: CancellationError())
+                }
+            }
+        }
+    }
+
+    private func pushViaLegacyWs(
+        local: URL,
+        to remotePath: String,
+        deviceId: String?,
+        onProgress: ((Double) -> Void)?
     ) async throws {
         let reqId = Self.makeReqId()
         let fm = FileManager.default
@@ -231,13 +459,13 @@ final class ProtocolFileClient {
         }
 
         let slot = Pending()
+        slot.deviceId = deviceId
         pending[reqId] = slot
 
-        // Wait for "ready" from the phone.
         do {
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
                 slot.resumeWriteReady = cont
-                WsServer.shared.send(.fsWrite(reqId: reqId, path: remotePath, size: size))
+                WsServer.shared.send(.fsWrite(reqId: reqId, path: remotePath, size: size), to: deviceId)
             }
         } catch {
             try? handle.close()
@@ -245,20 +473,25 @@ final class ProtocolFileClient {
             throw error
         }
 
-        // Stream chunks as WS binary frames. No base64, no JSON, no second
-        // TCP connection — just the healthy WS socket with raw bytes.
         let streamResult: Result<Void, Error> = await Task.detached(priority: .userInitiated) {
             defer { try? handle.close() }
             var offset: Int64 = 0
             while true {
+                if Task.isCancelled { return .failure(CancellationError()) }
                 let data = handle.readData(ofLength: Self.chunkSize)
                 if data.isEmpty && offset > 0 { return .success(()) }
                 let isLast = (offset + Int64(data.count) >= size)
 
-                WsServer.shared.sendBinaryChunk(
-                    kind: WsServer.chunkKindFs, id: reqId,
-                    offset: offset, payload: data, last: isLast
-                )
+                await withCheckedContinuation { (sentCont: CheckedContinuation<Void, Never>) in
+                    WsServer.shared.sendBinaryChunk(
+                        kind: WsServer.chunkKindFs,
+                        id: reqId,
+                        offset: offset,
+                        payload: data,
+                        last: isLast,
+                        to: deviceId
+                    ) { _ in sentCont.resume() }
+                }
 
                 offset += Int64(data.count)
                 if let cb = onProgress {
@@ -270,11 +503,11 @@ final class ProtocolFileClient {
         }.value
 
         if case let .failure(error) = streamResult {
+            WsServer.shared.send(.fsCancel(reqId: reqId, reason: "user_cancelled"), to: deviceId)
             pending.removeValue(forKey: reqId)
             throw error
         }
 
-        // Wait for the phone's final fs_op_result.
         do {
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
                 slot.resumeWriteDone = cont
@@ -286,7 +519,7 @@ final class ProtocolFileClient {
         pending.removeValue(forKey: reqId)
     }
 
-    // MARK: - Inbound dispatch (called from WsServer)
+    // MARK: - Inbound dispatch
 
     func deliver(_ message: WireMessage) {
         switch message {
@@ -296,8 +529,6 @@ final class ProtocolFileClient {
             }
         case let .fsOpResult(reqId, ok, error):
             guard let slot = pending[reqId] else { return }
-            // This message serves two flows: generic ops (delete/mkdir) and
-            // "write completed" for push.
             if let cont = slot.resumeOp {
                 pending.removeValue(forKey: reqId)
                 if ok { cont.resume() }
@@ -306,17 +537,15 @@ final class ProtocolFileClient {
             }
             if let cont = slot.resumeWriteDone {
                 pending.removeValue(forKey: reqId)
+                slot.resumeWriteDone = nil
                 if ok { cont.resume() }
                 else { cont.resume(throwing: FsError(message: error ?? "write failed")) }
                 return
             }
         case let .fsDiskResult(reqId, free, total, error):
             if let slot = pending.removeValue(forKey: reqId) {
-                if let err = error {
-                    slot.resumeDisk?.resume(throwing: FsError(message: err))
-                } else {
-                    slot.resumeDisk?.resume(returning: (free, total))
-                }
+                if let err = error { slot.resumeDisk?.resume(throwing: FsError(message: err)) }
+                else { slot.resumeDisk?.resume(returning: (free, total)) }
             }
         case let .fsDuResult(reqId, path, totalSize, entries, error):
             if let slot = pending.removeValue(forKey: reqId) {
@@ -329,24 +558,19 @@ final class ProtocolFileClient {
                 }
             }
         case let .fsReadResult(reqId, size, error):
-            guard let slot = pending[reqId] else {
-                DebugLog.line("[fspull] fsReadResult for unknown reqId=\(reqId)")
-                return
-            }
+            guard let slot = pending[reqId] else { return }
             if let err = error {
-                DebugLog.line("[fspull] fsReadResult err reqId=\(reqId) msg=\(err)")
                 pending.removeValue(forKey: reqId)
-                slot.resumeRead?.resume(throwing: FsError(message: err))
+                if slot.usesBulkHttp { BulkTransferServer.shared.cancel(id: reqId) }
+                let cont = slot.resumeRead
+                slot.resumeRead = nil
+                cont?.resume(throwing: FsError(message: err))
                 return
             }
-            DebugLog.line("[fspull] fsReadResult reqId=\(reqId) size=\(size)")
             slot.readExpectedSize = size
         case let .fsChunk(reqId, offset, data, last):
-            // Legacy WS chunk path (pre-data-channel peers). Decode base64 and
-            // hand off to the binary handler. Current peers push these through
-            // DataServer instead.
             let bytes = Data(base64Encoded: data) ?? Data()
-            handleBinaryChunk(reqId: reqId, offset: offset, bytes: bytes, last: last)
+            handleBinaryChunk(reqId: reqId, offset: offset, bytes: bytes, last: last, from: nil)
         case let .fsWriteReady(reqId, error):
             guard let slot = pending[reqId] else { return }
             if let err = error {
@@ -356,93 +580,111 @@ final class ProtocolFileClient {
             }
             slot.resumeWriteReady?.resume()
             slot.resumeWriteReady = nil
+        case let .fsThumbResult(reqId, data, error):
+            if let slot = pending.removeValue(forKey: reqId) {
+                let cont = slot.resumeThumb
+                slot.resumeThumb = nil
+                if let err = error {
+                    cont?.resume(throwing: FsError(message: err))
+                } else if let b64 = data, let raw = Data(base64Encoded: b64) {
+                    cont?.resume(returning: raw)
+                } else {
+                    cont?.resume(throwing: FsError(message: "invalid thumbnail"))
+                }
+            }
         default:
-            break  // not ours
+            break
         }
     }
 
-    /// Set of reqIds we've already told the phone to cancel. Prevents spamming
-    /// `fs_cancel` for every orphaned chunk when the pull has already been
-    /// abandoned locally — one cancel is enough.
-    private var cancelledReqs: Set<String> = []
-
-    /// Entry point from the raw-TCP data channel. Binary payload, no
-    /// base64 decode on the critical path. The DataServer reader dispatches
-    /// in order already; heavy file I/O runs on `chunkWriteQueue` so the
-    /// main actor stays free for other tasks (diskAnalyze, SwiftUI, etc.).
-    func handleBinaryChunk(reqId: String, offset: Int64, bytes: Data, last: Bool) {
-        guard let slot = pending[reqId] else {
-            DebugLog.line("[fspull] binaryChunk for unknown reqId=\(reqId) offset=\(offset) last=\(last)")
-            // First orphan chunk for this reqId — tell the phone to stop.
-            // Without this, the phone's read-ahead keeps generating chunks
-            // for a slot that's been cleaned up (watchdog timeout, user
-            // cancel, etc.), wasting the Wi-Fi link for minutes.
-            if cancelledReqs.insert(reqId).inserted {
-                WsServer.shared.send(.fsCancel(reqId: reqId, reason: "unknown_reqId"))
-            }
-            return
-        }
-        DebugLog.line("[fspull] binaryChunk reqId=\(reqId) offset=\(offset) len=\(bytes.count) last=\(last)")
-        guard let handle = slot.readHandle else {
-            if last {
-                pending.removeValue(forKey: reqId)
-                slot.resumeRead?.resume()
-            }
-            return
-        }
+    /// Legacy WS binary chunk receiver — writes directly on `chunkWriteQueue`
+    /// without bouncing through `@MainActor` per chunk.
+    nonisolated func handleBinaryChunk(
+        reqId: String,
+        offset: Int64,
+        bytes: Data,
+        last: Bool,
+        from deviceId: String?
+    ) {
         Self.chunkWriteQueue.async {
+            guard let handle = Self.legacyHandles[reqId] else {
+                Task { @MainActor in
+                    if ProtocolFileClient.shared.pending[reqId] == nil,
+                       ProtocolFileClient.shared.cancelledReqs.insert(reqId).inserted {
+                        WsServer.shared.send(.fsCancel(reqId: reqId, reason: "unknown_reqId"), to: deviceId)
+                    }
+                }
+                return
+            }
             if !bytes.isEmpty {
                 try? handle.seek(toOffset: UInt64(offset))
                 try? handle.write(contentsOf: bytes)
             }
             let soFar = offset + Int64(bytes.count)
+            let now = CFAbsoluteTimeGetCurrent()
+            if last {
+                _ = Self.legacyHandles.removeValue(forKey: reqId)
+                try? handle.close()
+            }
             Task { @MainActor in
                 guard let slot = ProtocolFileClient.shared.pending[reqId] else { return }
                 slot.readBytesSoFar = soFar
-                slot.lastChunkAt = CFAbsoluteTimeGetCurrent()
-                if let cb = slot.readProgress, slot.readExpectedSize > 0 {
-                    let pct = min(1.0, Double(soFar) / Double(slot.readExpectedSize))
-                    let now = CFAbsoluteTimeGetCurrent()
-                    if last || now - slot.lastProgressAt > 0.1 {
-                        slot.lastProgressAt = now
-                        cb(pct)
-                    }
+                slot.lastChunkAt = now
+                if let cb = slot.readProgress, slot.readExpectedSize > 0,
+                   last || now - slot.lastProgressAt >= 0.1 {
+                    slot.lastProgressAt = now
+                    cb(min(1.0, Double(soFar) / Double(slot.readExpectedSize)))
                 }
                 if last {
                     ProtocolFileClient.shared.pending.removeValue(forKey: reqId)
-                    slot.resumeRead?.resume()
+                    let cont = slot.resumeRead
+                    slot.resumeRead = nil
+                    cont?.resume()
                 }
             }
         }
     }
 
-    /// Called by WsServer when the connection drops; fail every in-flight op
-    /// so UI doesn't hang.
-    func peerDisconnected() {
-        cancelledReqs.removeAll()
+    func peerDisconnected(deviceId: String? = nil) {
         let err = FsError(message: "disconnected")
-        for (_, slot) in pending {
+        let matchingKeys: [String]
+        if let deviceId {
+            matchingKeys = pending.compactMap { $0.value.deviceId == deviceId ? $0.key : nil }
+        } else {
+            cancelledReqs.removeAll()
+            matchingKeys = Array(pending.keys)
+        }
+        for key in matchingKeys {
+            guard let slot = pending.removeValue(forKey: key) else { continue }
+            if slot.usesBulkHttp { BulkTransferServer.shared.cancel(id: key) }
             slot.resumeList?.resume(throwing: err)
             slot.resumeOp?.resume(throwing: err)
             slot.resumeDisk?.resume(throwing: err)
             slot.resumeDu?.resume(throwing: err)
+            slot.resumeThumb?.resume(throwing: err)
+            slot.resumeThumb = nil
             slot.resumeRead?.resume(throwing: err)
+            slot.resumeRead = nil
             slot.resumeWriteReady?.resume(throwing: err)
             slot.resumeWriteDone?.resume(throwing: err)
-            if let h = slot.readHandle { try? h.close() }
+            slot.resumeWriteDone = nil
+            Self.chunkWriteQueue.async {
+                if let h = Self.legacyHandles.removeValue(forKey: key) { try? h.close() }
+            }
         }
-        pending.removeAll()
     }
 
     // MARK: - Helpers
 
-    private func opCall(_ makeMsg: (String) -> WireMessage) async throws {
+    private func opCall(deviceId: String?, _ makeMsg: (String) -> WireMessage) async throws {
         let reqId = Self.makeReqId()
+        let target = resolveDeviceId(deviceId)
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             let slot = Pending()
+            slot.deviceId = target
             slot.resumeOp = cont
             pending[reqId] = slot
-            WsServer.shared.send(makeMsg(reqId))
+            WsServer.shared.send(makeMsg(reqId), to: target)
         }
     }
 

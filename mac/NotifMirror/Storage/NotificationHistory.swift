@@ -28,6 +28,9 @@ final class NotificationHistory: ObservableObject {
         /// Optional for backward-compat with history JSON written before
         /// this field existed.
         let actions: [ActionDescriptor]?
+        /// Source phone identity (optional for backward-compat with pre-2.0 history JSON).
+        let deviceId: String?
+        let deviceName: String?
     }
 
     private init() {
@@ -41,7 +44,12 @@ final class NotificationHistory: ObservableObject {
         load()
     }
 
-    func record(_ p: WireMessage.Posted, attachmentPath: String?) {
+    func record(
+        _ p: WireMessage.Posted,
+        attachmentPath: String?,
+        deviceId: String? = nil,
+        deviceName: String? = nil
+    ) {
         let entry = Entry(
             id: UUID(),
             key: p.key,
@@ -52,7 +60,9 @@ final class NotificationHistory: ObservableObject {
             receivedAt: Date(),
             silent: p.silent,
             attachmentPath: attachmentPath,
-            actions: p.actions.isEmpty ? nil : p.actions
+            actions: p.actions.isEmpty ? nil : p.actions,
+            deviceId: deviceId,
+            deviceName: deviceName
         )
         entries.insert(entry, at: 0)
         if entries.count > cap {
@@ -87,14 +97,26 @@ final class NotificationHistory: ObservableObject {
         save()
     }
 
-    func remove(_ entry: Entry) {
+    func remove(_ entry: Entry, preserveAttachment: Bool = false) {
         if let idx = entries.firstIndex(of: entry) {
-            if let path = entries[idx].attachmentPath {
+            if !preserveAttachment, let path = entries[idx].attachmentPath {
                 try? FileManager.default.removeItem(atPath: path)
             }
             entries.remove(at: idx)
             save()
         }
+    }
+
+    func restore(_ entry: Entry) {
+        guard !entries.contains(where: { $0.id == entry.id }) else { return }
+        let idx = entries.firstIndex { $0.receivedAt < entry.receivedAt } ?? entries.endIndex
+        entries.insert(entry, at: idx)
+        save()
+    }
+
+    func deleteAttachment(at path: String?) {
+        guard let path else { return }
+        try? FileManager.default.removeItem(atPath: path)
     }
 
     private func load() {

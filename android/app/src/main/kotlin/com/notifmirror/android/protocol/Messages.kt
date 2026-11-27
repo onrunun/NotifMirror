@@ -13,7 +13,8 @@ sealed class WireMessage {
         val secret: String,
         val deviceName: String,
         val proto: Int,
-        val features: List<String> = emptyList()
+        val features: List<String> = emptyList(),
+        val deviceId: String? = null
     ) : WireMessage()
 
     data class HelloAck(
@@ -150,6 +151,10 @@ sealed class WireMessage {
 
     data class FsCancel(val reqId: String, val reason: String) : WireMessage()
 
+    /** Mac → phone: request a small scaled JPEG thumbnail for an image or video. */
+    data class FsThumb(val reqId: String, val path: String, val maxDim: Int = 240) : WireMessage()
+    data class FsThumbResult(val reqId: String, val data: String?, val error: String?) : WireMessage()
+
     /** Mac → phone end-to-end notification test. The phone must post a real
      *  notification from this app's package (NotificationListener will then
      *  catch it and mirror back), with `reqId` embedded in the body so the
@@ -182,6 +187,7 @@ object WireCodec {
                 obj.put("secret", message.secret)
                 obj.put("deviceName", message.deviceName)
                 obj.put("proto", message.proto)
+                if (message.deviceId != null) obj.put("deviceId", message.deviceId)
                 if (message.features.isNotEmpty()) {
                     obj.put("features", JSONArray(message.features))
                 }
@@ -392,6 +398,18 @@ object WireCodec {
                 obj.put("reqId", message.reqId)
                 obj.put("reason", message.reason)
             }
+            is WireMessage.FsThumb -> {
+                obj.put("t", "fs_thumb")
+                obj.put("reqId", message.reqId)
+                obj.put("path", message.path)
+                obj.put("maxDim", message.maxDim)
+            }
+            is WireMessage.FsThumbResult -> {
+                obj.put("t", "fs_thumb_result")
+                obj.put("reqId", message.reqId)
+                if (message.data != null) obj.put("data", message.data)
+                if (message.error != null) obj.put("error", message.error)
+            }
             is WireMessage.TestRequest -> {
                 obj.put("t", "test_request"); obj.put("reqId", message.reqId)
             }
@@ -425,7 +443,8 @@ object WireCodec {
                 secret = obj.getString("secret"),
                 deviceName = obj.getString("deviceName"),
                 proto = obj.getInt("proto"),
-                features = obj.optJSONArray("features").toStringListOrEmpty()
+                features = obj.optJSONArray("features").toStringListOrEmpty(),
+                deviceId = obj.optStringOrNull("deviceId")
             )
             "hello_ack" -> WireMessage.HelloAck(
                 accepted = obj.optBoolean("accepted"),
@@ -607,6 +626,16 @@ object WireCodec {
             "fs_cancel" -> WireMessage.FsCancel(
                 reqId = obj.getString("reqId"),
                 reason = obj.optString("reason", "abandoned")
+            )
+            "fs_thumb" -> WireMessage.FsThumb(
+                reqId = obj.getString("reqId"),
+                path = obj.getString("path"),
+                maxDim = obj.optInt("maxDim", 240)
+            )
+            "fs_thumb_result" -> WireMessage.FsThumbResult(
+                reqId = obj.getString("reqId"),
+                data = obj.optStringOrNull("data"),
+                error = obj.optStringOrNull("error")
             )
             "test_request" -> WireMessage.TestRequest(reqId = obj.getString("reqId"))
             "blocklist" -> {

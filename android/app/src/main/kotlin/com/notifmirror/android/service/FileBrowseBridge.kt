@@ -44,6 +44,12 @@ class FileBrowseBridge(private val context: Context) {
         Thread(r, "fs-du").apply { isDaemon = true }
     }
 
+    /// Dedicated thumbnail pool so rapid photo-grid scrolling never starves
+    /// directory listings or file transfers.
+    private val thumbExecutor = Executors.newFixedThreadPool(2) { r ->
+        Thread(r, "fs-thumb").apply { isDaemon = true }
+    }
+
     /** Active outgoing reads, keyed by reqId; used to cancel on disconnect. */
     private val activeReads = ConcurrentHashMap<String, AtomicBoolean>()
 
@@ -71,7 +77,17 @@ class FileBrowseBridge(private val context: Context) {
             is WireMessage.FsWrite -> handleWrite(message)
             is WireMessage.FsChunk -> handleWriteChunk(message)
             is WireMessage.FsCancel -> handleCancel(message)
+            is WireMessage.FsThumb -> thumbExecutor.execute { handleThumb(message) }
             else -> {}
+        }
+    }
+
+    private fun handleThumb(msg: WireMessage.FsThumb) {
+        when (val result = MediaThumbnailer.generate(File(msg.path), msg.maxDim)) {
+            is MediaThumbnailer.Outcome.Ok ->
+                reply(WireMessage.FsThumbResult(msg.reqId, result.base64Jpeg, null))
+            is MediaThumbnailer.Outcome.Err ->
+                reply(WireMessage.FsThumbResult(msg.reqId, null, result.message))
         }
     }
 
@@ -82,6 +98,7 @@ class FileBrowseBridge(private val context: Context) {
     private fun handleCancel(msg: WireMessage.FsCancel) {
         Log.i(TAG, "peer cancelled reqId=${msg.reqId} reason=${msg.reason}")
         activeReads[msg.reqId]?.set(true)
+        MirrorCore.cancelBulk(msg.reqId)
         val write = activeWrites.remove(msg.reqId)
         if (write != null) {
             try { write.out.close() } catch (_: Throwable) {}
@@ -297,7 +314,29 @@ class FileBrowseBridge(private val context: Context) {
         activeReads[msg.reqId] = cancelled
 
         readExecutor.execute {
+            val bulk = MirrorCore.bulkEndpoint()
             MirrorCore.beginFileTransfer()
+            if (bulk != null) {
+                try {
+                    bulk.client.uploadStream(
+                        host = bulk.host,
+                        port = bulk.port,
+                        secret = bulk.secret,
+                        id = msg.reqId,
+                        contentLength = size,
+                        openInput = { file.inputStream() }
+                    )
+                } catch (e: Throwable) {
+                    if (!cancelled.get()) {
+                        Log.w(TAG, "bulk upload failed reqId=${msg.reqId}", e)
+                    }
+                } finally {
+                    activeReads.remove(msg.reqId)
+                    MirrorCore.endFileTransfer()
+                }
+                return@execute
+            }
+
             RadioKeepAlive.begin()
             try {
                 Log.i(TAG, "read start reqId=${msg.reqId} size=$size path=${msg.path}")
@@ -378,14 +417,38 @@ class FileBrowseBridge(private val context: Context) {
     // ---------- Write (Mac → phone) ----------
 
     private fun handleWrite(msg: WireMessage.FsWrite) {
+        val bulk = MirrorCore.bulkEndpoint()
+        if (bulk != null) {
+            readExecutor.execute {
+                val target = File(msg.path)
+                MirrorCore.beginFileTransfer()
+                try {
+                    target.parentFile?.let { if (!it.exists()) it.mkdirs() }
+                    FileOutputStream(target).use { out ->
+                        bulk.client.downloadToStream(
+                            host = bulk.host,
+                            port = bulk.port,
+                            secret = bulk.secret,
+                            id = msg.reqId,
+                            out = out
+                        )
+                    }
+                    reply(WireMessage.FsOpResult(msg.reqId, true, null))
+                } catch (e: Throwable) {
+                    Log.w(TAG, "bulk write failed reqId=${msg.reqId}", e)
+                    try { target.delete() } catch (_: Throwable) {}
+                    reply(WireMessage.FsOpResult(msg.reqId, false, e.message ?: "error"))
+                } finally {
+                    MirrorCore.endFileTransfer()
+                }
+            }
+            return
+        }
         try {
             val target = File(msg.path)
             target.parentFile?.let { if (!it.exists()) it.mkdirs() }
             val out: OutputStream = FileOutputStream(target)
             activeWrites[msg.reqId] = IncomingWrite(msg.path, msg.size, out, 0)
-            // Mac is about to stream chunks in; hold the radio at high perf
-            // AND spam keep-alive frames until we see the final chunk in
-            // handleWriteChunk.
             MirrorCore.beginFileTransfer()
             RadioKeepAlive.begin()
             reply(WireMessage.FsWriteReady(msg.reqId, null))
@@ -440,12 +503,7 @@ class FileBrowseBridge(private val context: Context) {
 
     companion object {
         private const val TAG = "FileBrowseBridge"
-        /** Same as FileBridge: ~256 KiB base64 → ~340 KiB JSON, well under 8 MiB cap. */
-        // 16 KiB chunks: on Android 16 + our macOS NWConnection listener we
-        // observed ~28 s stalls after ~5 × 64 KiB frames (classic TCP
-        // zero-window probe backoff, ~1+2+4+8+16 = 31 s). With 16 KiB
-        // frames the Mac side's receive callback fires ~4× more often, so
-        // the kernel receive buffer drains steadily and rwnd stays open.
-        private const val CHUNK_SIZE = 16 * 1024
+        /** Legacy WS binary fallback chunk size (active peers stream via `httpbulk`). */
+        private const val CHUNK_SIZE = 128 * 1024
     }
 }

@@ -17,6 +17,7 @@ final class DelegateHandler: NSObject, UNUserNotificationCenterDelegate {
                                 withCompletionHandler completionHandler: @escaping () -> Void) {
         let key = response.notification.request.identifier
         let identifier = response.actionIdentifier
+        let deviceId = response.notification.request.content.userInfo["deviceId"] as? String
 
         Task { @MainActor in
             // Clipboard-arrival banners aren't phone notifications — tapping
@@ -30,14 +31,9 @@ final class DelegateHandler: NSObject, UNUserNotificationCenterDelegate {
                 return
             }
             if identifier == UNNotificationDismissActionIdentifier {
-                WsServer.shared.sendDismiss(key: key)
+                WsServer.shared.sendDismiss(key: key, to: deviceId)
             } else if identifier == UNNotificationDefaultActionIdentifier {
-                // User clicked the notification body — open NotifMirror on the
-                // Notifications history pane and scroll to the matching entry
-                // so the full text (and any auto-detected verification code)
-                // is one click away. The synthetic __open__ action is still
-                // sent for any phone-side handling.
-                WsServer.shared.sendAction(key: key, actionId: "__open__", text: nil)
+                WsServer.shared.sendAction(key: key, actionId: "__open__", text: nil, to: deviceId)
                 MainWindowSelection.shared.pending = .notifications
                 MainWindowSelection.shared.pendingNotificationKey = key
                 AppState.shared.openMainWindowRequest = UUID()
@@ -45,9 +41,9 @@ final class DelegateHandler: NSObject, UNUserNotificationCenterDelegate {
             } else {
                 let actionId = parseActionId(from: identifier, key: key)
                 if let textResponse = response as? UNTextInputNotificationResponse {
-                    WsServer.shared.sendAction(key: key, actionId: actionId, text: textResponse.userText)
+                    WsServer.shared.sendAction(key: key, actionId: actionId, text: textResponse.userText, to: deviceId)
                 } else {
-                    WsServer.shared.sendAction(key: key, actionId: actionId, text: nil)
+                    WsServer.shared.sendAction(key: key, actionId: actionId, text: nil, to: deviceId)
                 }
             }
             completionHandler()

@@ -6,11 +6,11 @@ import java.util.concurrent.atomic.AtomicInteger
  * Keeps the Wi-Fi radio out of power-save during a bulk file transfer by
  * spamming tiny 1-byte binary WS frames at ~10 ms cadence.
  *
- * Empirically, on this device (Xiaomi Redmi Note 13 Pro / LineageOS + MT7981
- * AP), router→phone ping drops from avg 64 ms (with max 184 ms) to avg 6 ms
+ * Empirically, on Android Wi-Fi chipsets with aggressive power-save mode
+ * (PSM), router→phone ping drops from avg 64 ms (with max 184 ms) to avg 6 ms
  * as soon as the phone has a steady stream of outgoing packets. The Wi-Fi
  * stack's idle-to-PSM transition is the culprit, and even
- * `WIFI_MODE_FULL_LOW_LATENCY` doesn't fully prevent it on this platform.
+ * `WIFI_MODE_FULL_LOW_LATENCY` doesn't fully prevent it on all devices.
  *
  * Reference-counted: concurrent pulls / pushes share one heartbeat thread.
  * Enable via `begin()`, release via `end()`; thread auto-stops when refcount

@@ -1,15 +1,24 @@
 import Foundation
 import SwiftUI
 
+struct ConnectedDevice: Identifiable, Equatable {
+    let id: String
+    var name: String
+    var host: String?
+    var features: Set<String>
+    var battery: BatterySnapshot?
+    var media: MediaSnapshot
+    let connectedAt: Date
+}
+
 @MainActor
 final class AppState: ObservableObject {
     static let shared = AppState()
 
     @Published var isServerListening: Bool = false
     @Published var listenerPort: UInt16 = 0
-    @Published var isClientConnected: Bool = false
-    @Published var pairedDeviceName: String? = nil
-    @Published var peerHost: String? = nil
+    @Published var devices: [ConnectedDevice] = []
+    @Published var activeDeviceId: String? = nil
     @Published var scrcpyRunning: Bool = false
     @Published var notificationsMirroredCount: Int = 0
     @Published var lastError: String? = nil
@@ -17,34 +26,184 @@ final class AppState: ObservableObject {
     @Published var openMainWindowRequest: UUID? = nil
     @Published var pairingRevision: Int = 0
 
-    @Published var peerFeatures: Set<String> = []
-
-    // Media control state, mirrored from the phone.
-    @Published var media: MediaSnapshot = .empty
-
-    // Phone battery, mirrored. `nil` until the first battery_state arrives.
-    @Published var battery: BatterySnapshot? = nil
-
-    // Clipboard sync last-activity indicator (for the menu bar).
+    // Clipboard sync last-activity indicator + RAM-only session history (never written to disk).
     @Published var lastClipDirection: ClipDirection? = nil
     @Published var lastClipAt: Date? = nil
+    @Published var clipHistory: [ClipHistoryItem] = []
 
-    // File transfers, keyed by xid.
+    // Presentation / Pause Mirroring mode. When non-nil and in the future,
+    // macOS banners are suppressed while incoming notifications are still
+    // quietly logged to history.
+    @Published var pausedUntil: Date? = nil
+    private var pauseTimer: Timer?
+
+    // File transfers (both direct handoffs and Phone Files pulls/pushes), keyed by xid.
     @Published var transfers: [String: TransferProgress] = [:]
 
-    /// Set while an end-to-end notification test is in flight. Cleared by
-    /// the WS receive loop the moment a `posted` arrives whose body contains
-    /// this nonce — UI polls for that transition to distinguish success
-    /// from timeout.
+    /// Set while an end-to-end notification test is in flight.
     @Published var pendingE2ETestReqId: String? = nil
 
     private init() {}
 
+    // MARK: - Multi-device helpers & compatibility accessors
+
+    var activeDevice: ConnectedDevice? {
+        if let id = activeDeviceId, let found = devices.first(where: { $0.id == id }) {
+            return found
+        }
+        return devices.first
+    }
+
+    var mediaDevice: ConnectedDevice? {
+        if let active = activeDevice, active.media.hasSession {
+            return active
+        }
+        if let playing = devices.first(where: { $0.media.hasSession && $0.media.playing }) {
+            return playing
+        }
+        if let anySession = devices.first(where: { $0.media.hasSession }) {
+            return anySession
+        }
+        return activeDevice
+    }
+
+    var isClientConnected: Bool { !devices.isEmpty }
+    var pairedDeviceName: String? { activeDevice?.name }
+    var peerHost: String? { activeDevice?.host }
+    var peerFeatures: Set<String> { activeDevice?.features ?? [] }
+    var battery: BatterySnapshot? { activeDevice?.battery }
+    var media: MediaSnapshot { mediaDevice?.media ?? .empty }
+
+    func device(id: String?) -> ConnectedDevice? {
+        if let id, let found = devices.first(where: { $0.id == id }) {
+            return found
+        }
+        return activeDevice
+    }
+
+    func upsertDevice(id: String, name: String, host: String?, features: Set<String>) {
+        if let idx = devices.firstIndex(where: { $0.id == id }) {
+            devices[idx].name = name
+            devices[idx].host = host
+            devices[idx].features = features
+        } else {
+            devices.append(ConnectedDevice(
+                id: id,
+                name: name,
+                host: host,
+                features: features,
+                battery: nil,
+                media: .empty,
+                connectedAt: Date()
+            ))
+        }
+        if activeDeviceId == nil || !devices.contains(where: { $0.id == activeDeviceId }) {
+            activeDeviceId = devices.first?.id
+        }
+        WsServer.shared.setDefaultTargetDevice(activeDeviceId)
+    }
+
+    func removeDevice(id: String) {
+        devices.removeAll { $0.id == id }
+        if activeDeviceId == id {
+            activeDeviceId = devices.first?.id
+        }
+        WsServer.shared.setDefaultTargetDevice(activeDeviceId)
+    }
+
+    func removeAllDevices() {
+        devices.removeAll()
+        activeDeviceId = nil
+        WsServer.shared.setDefaultTargetDevice(nil)
+    }
+
+    func selectDevice(_ id: String) {
+        guard devices.contains(where: { $0.id == id }) else { return }
+        activeDeviceId = id
+        WsServer.shared.setDefaultTargetDevice(id)
+    }
+
+    func updateBattery(_ snapshot: BatterySnapshot?, for deviceId: String) {
+        guard let idx = devices.firstIndex(where: { $0.id == deviceId }) else { return }
+        devices[idx].battery = snapshot
+    }
+
+    func updateMedia(_ snapshot: MediaSnapshot, for deviceId: String) {
+        guard let idx = devices.firstIndex(where: { $0.id == deviceId }) else { return }
+        devices[idx].media = snapshot
+    }
+
     func incrementMirrored() { notificationsMirroredCount += 1 }
+
+    // MARK: - Presentation / Pause Mirroring Mode
+
+    var isMirroringPaused: Bool {
+        guard let until = pausedUntil else { return false }
+        return until > Date()
+    }
+
+    var pauseLabel: String? {
+        guard let until = pausedUntil, until > Date() else { return nil }
+        if until == .distantFuture { return "Paused until resumed" }
+        let fmt = DateFormatter()
+        fmt.timeStyle = .short
+        fmt.dateStyle = .none
+        return "Paused until \(fmt.string(from: until))"
+    }
+
+    func pauseMirroring(for duration: TimeInterval?) {
+        pauseTimer?.invalidate()
+        pauseTimer = nil
+        if let duration {
+            let until = Date().addingTimeInterval(duration)
+            pausedUntil = until
+            pauseTimer = Timer.scheduledTimer(withTimeInterval: duration, repeats: false) { [weak self] _ in
+                Task { @MainActor in self?.resumeMirroring() }
+            }
+        } else {
+            pausedUntil = .distantFuture
+        }
+    }
+
+    func resumeMirroring() {
+        pauseTimer?.invalidate()
+        pauseTimer = nil
+        pausedUntil = nil
+    }
+
+    // MARK: - RAM-only Clipboard History
+
+    func recordClip(_ text: String, direction: ClipDirection, deviceName: String? = nil) {
+        if let first = clipHistory.first, first.text == text, first.direction == direction {
+            clipHistory[0] = ClipHistoryItem(
+                id: first.id, text: text, direction: direction, deviceName: deviceName, at: Date()
+            )
+            return
+        }
+        clipHistory.insert(
+            ClipHistoryItem(id: UUID(), text: text, direction: direction, deviceName: deviceName, at: Date()),
+            at: 0
+        )
+        if clipHistory.count > 10 {
+            clipHistory.removeLast(clipHistory.count - 10)
+        }
+    }
+
+    func clearClipHistory() {
+        clipHistory.removeAll()
+    }
 }
 
 enum ClipDirection: String {
     case incoming, outgoing
+}
+
+struct ClipHistoryItem: Identifiable, Equatable {
+    let id: UUID
+    let text: String
+    let direction: ClipDirection
+    var deviceName: String? = nil
+    let at: Date
 }
 
 struct MediaSnapshot: Equatable {
@@ -85,12 +244,8 @@ struct BatterySnapshot: Equatable {
     var low: Bool
     var updatedAt: Date
 
-    /// True when we have a usable level (the phone actually reported one).
     var hasLevel: Bool { level >= 0 }
 
-    /// The SF Symbol that best represents this battery state. Falls back to
-    /// a level-bracketed symbol when not charging, and to the bolt-bearing
-    /// symbol whenever charging.
     var sfSymbol: String {
         if !hasLevel { return "battery.0" }
         if charging { return "battery.100.bolt" }
@@ -103,8 +258,6 @@ struct BatterySnapshot: Equatable {
         }
     }
 
-    /// Tint colour for the indicator. Red below 15 %, orange 15–25 %, green
-    /// while charging, secondary otherwise.
     var tint: Color {
         if low || (hasLevel && level <= 15) { return .red }
         if hasLevel && level <= 25 { return .orange }
@@ -115,6 +268,7 @@ struct BatterySnapshot: Equatable {
 
 struct TransferProgress: Identifiable, Equatable {
     enum Direction { case incoming, outgoing }
+    enum Source: Equatable { case direct, filesBrowse }
     enum Status: Equatable {
         case pending        // offer sent, waiting for accept
         case active
@@ -125,9 +279,22 @@ struct TransferProgress: Identifiable, Equatable {
 
     let id: String           // xid
     let direction: Direction
-    let name: String
-    let size: Int64
+    var source: Source = .direct
+    var deviceId: String? = nil
+    var deviceName: String? = nil
+    var name: String
+    var size: Int64
     var bytesTransferred: Int64
     var status: Status
     var destinationPath: String? = nil
+    var sourceURL: URL? = nil
+    var itemCount: Int = 1
+    var startedAt: Date = Date()
+
+    var isInFlight: Bool {
+        switch status {
+        case .pending, .active: return true
+        default: return false
+        }
+    }
 }

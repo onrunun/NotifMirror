@@ -1,32 +1,56 @@
 import Foundation
 import Network
 
+/// TLS WebSocket server supporting multiple simultaneous Android phones.
+///
+/// Any phone that scans the Mac's pairing QR (same 256-bit secret + RSA-2048
+/// SPKI fingerprint) can connect concurrently. Each phone is keyed by its
+/// persistent `deviceId` (or fallback `deviceName@host` for older peers) so a
+/// reconnect cleanly replaces only that phone's previous socket without
+/// disturbing other connected phones.
 final class WsServer: @unchecked Sendable {
     static let shared = WsServer()
 
+    private final class ClientSession {
+        let deviceId: String
+        let deviceName: String
+        let host: String?
+        let conn: NWConnection
+        var features: Set<String>
+
+        init(deviceId: String, deviceName: String, host: String?, conn: NWConnection, features: Set<String>) {
+            self.deviceId = deviceId
+            self.deviceName = deviceName
+            self.host = host
+            self.conn = conn
+            self.features = features
+        }
+    }
+
     private let queue = DispatchQueue(label: "com.notifmirror.app.wsserver")
     private var listener: NWListener?
-    private var connection: NWConnection?
-    private var authedConnection: NWConnection?
-
-    /// Features advertised by the currently-authenticated client. Empty until
-    /// HELLO arrives. Read-only from outside.
-    private(set) var peerFeatures: Set<String> = []
+    private var pendingConnections: [ObjectIdentifier: NWConnection] = [:]
+    private var sessionsByDeviceId: [String: ClientSession] = [:]
+    private var sessionByConn: [ObjectIdentifier: ClientSession] = [:]
+    private var defaultTargetDeviceId: String? = nil
 
     private init() {}
 
     static let listenPortPrefKey = "serverListenPort"
 
     func start() throws {
+        // Bring up the TLS HTTP/1.1 bulk data plane first so its ephemeral
+        // port is ready to advertise in `hello_ack.dataPort`.
+        do {
+            try BulkTransferServer.shared.start()
+        } catch {
+            NSLog("BulkTransferServer start failed (falling back to WS): \(error)")
+        }
+
         let wsOptions = NWProtocolWebSocket.Options()
         wsOptions.autoReplyPing = true
-        wsOptions.maximumMessageSize = 8 * 1024 * 1024 // 8 MiB cap
+        wsOptions.maximumMessageSize = 8 * 1024 * 1024
 
-        // TLS with the self-signed leaf cert from SelfSignedCert. The
-        // Android client pins this cert by SPKI SHA-256 (the `fp` field in
-        // the pairing QR), so no CA chain is involved — we hand the same
-        // identity to every connecting client and rely entirely on the
-        // pinning + the pairing secret for authentication.
         let identity = try SelfSignedCert.shared.identity()
         guard let secId = sec_identity_create(identity) else {
             throw CertError.parse("sec_identity_create returned nil")
@@ -40,17 +64,11 @@ final class WsServer: @unchecked Sendable {
         parameters.allowLocalEndpointReuse = true
         parameters.includePeerToPeer = true
         if let tcp = parameters.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options {
-            // Kick Nagle off on the server side of the WS so inbound chunk
-            // ACKs go back without waiting, and keepalive so genuinely dead
-            // connections surface quickly.
             tcp.noDelay = true
             tcp.enableKeepalive = true
         }
         parameters.defaultProtocolStack.applicationProtocols.insert(wsOptions, at: 0)
 
-        // Reuse the last successful port so the QR we handed to the phone
-        // stays valid across app restarts. Falls back to an ephemeral port
-        // if the saved one is taken (stateUpdateHandler handles that path).
         let savedPort = UserDefaults.standard.object(forKey: Self.listenPortPrefKey) as? Int
         let l: NWListener
         if let raw = savedPort, raw > 0, raw <= 65535,
@@ -80,9 +98,6 @@ final class WsServer: @unchecked Sendable {
                     AppState.shared.lastError = "Listener failed: \(err.localizedDescription)"
                 }
                 NSLog("WsServer failed: \(err)")
-                // If we were trying to rebind a previously-used port that's
-                // now taken by something else, drop it so the restart picks
-                // an ephemeral one.
                 UserDefaults.standard.removeObject(forKey: Self.listenPortPrefKey)
                 self?.scheduleRestart()
             case .cancelled:
@@ -98,10 +113,6 @@ final class WsServer: @unchecked Sendable {
 
         l.start(queue: queue)
         listener = l
-
-        // DataServer (separate raw-TCP bulk channel) is retired: file bytes
-        // now ride as WS binary frames on this very listener, which proved
-        // much more robust than a sibling TCP socket on the same radio.
     }
 
     private func scheduleRestart() {
@@ -112,20 +123,10 @@ final class WsServer: @unchecked Sendable {
         }
     }
 
-    private func accept(_ conn: NWConnection) {
-        if let existing = connection, existing !== conn {
-            NSLog("dropping previous connection in favour of new client")
-            existing.cancel()
-            connection = nil
-            authedConnection = nil
-            peerFeatures = []
-            Task { @MainActor in
-                AppState.shared.isClientConnected = false
-                AppState.shared.pairedDeviceName = nil
-            }
-        }
+    // MARK: - Connection lifecycle
 
-        connection = conn
+    private func accept(_ conn: NWConnection) {
+        pendingConnections[ObjectIdentifier(conn)] = conn
         conn.stateUpdateHandler = { [weak self, weak conn] state in
             guard let self, let conn else { return }
             switch state {
@@ -145,34 +146,28 @@ final class WsServer: @unchecked Sendable {
     }
 
     private func dropConnection(_ conn: NWConnection) {
-        // Only mutate session state when the connection we're dropping is
-        // actually the live one. A `.cancelled` event for a stale socket
-        // (e.g. the previous client that we kicked when a new one came in)
-        // would otherwise spuriously flip `isClientConnected` to false even
-        // though a fresh client is already authenticated — making the UI
-        // flicker into "Waiting for phone…" while the phone is still talking.
-        let wasCurrent = (connection === conn) || (authedConnection === conn)
-        if connection === conn { connection = nil }
-        if authedConnection === conn {
-            authedConnection = nil
-            peerFeatures = []
-        }
-        guard wasCurrent else {
-            DebugLog.line("[ws] stale drop ignored — current session unaffected")
+        let key = ObjectIdentifier(conn)
+        pendingConnections.removeValue(forKey: key)
+        guard let session = sessionByConn.removeValue(forKey: key) else {
             return
         }
-        Task { @MainActor in
-            AppState.shared.isClientConnected = false
-            AppState.shared.pairedDeviceName = nil
-            AppState.shared.peerHost = nil
+        // Only tear down device state if this socket is still the live session
+        // for `session.deviceId` (not an older socket replaced on reconnect).
+        guard sessionsByDeviceId[session.deviceId]?.conn === conn else {
+            return
         }
-        // Tell subsystems that rely on the client side so they can reset
-        // their state (in-flight transfers etc).
+        sessionsByDeviceId.removeValue(forKey: session.deviceId)
+        if defaultTargetDeviceId == session.deviceId {
+            defaultTargetDeviceId = sessionsByDeviceId.keys.sorted().first
+        }
+
+        let droppedId = session.deviceId
         Task { @MainActor in
-            FileTransferCenter.shared.peerDisconnected()
-            MediaController.shared.peerDisconnected()
-            ProtocolFileClient.shared.peerDisconnected()
-            BatteryStore.shared.peerDisconnected()
+            AppState.shared.removeDevice(id: droppedId)
+            FileTransferCenter.shared.peerDisconnected(deviceId: droppedId)
+            MediaController.shared.peerDisconnected(deviceId: droppedId)
+            ProtocolFileClient.shared.peerDisconnected(deviceId: droppedId)
+            BatteryStore.shared.peerDisconnected(deviceId: droppedId)
         }
     }
 
@@ -183,7 +178,6 @@ final class WsServer: @unchecked Sendable {
             case .ipv4(let a):
                 return a.debugDescription
             case .ipv6(let a):
-                // Strip zone id if present (e.g. fe80::1%en0 → fe80::1).
                 let s = a.debugDescription
                 return s.split(separator: "%").first.map(String.init) ?? s
             case .name(let n, _):
@@ -196,59 +190,31 @@ final class WsServer: @unchecked Sendable {
     }
 
     private func receive(on conn: NWConnection) {
-        conn.receiveMessage { [weak self, weak conn] data, context, isComplete, error in
+        conn.receiveMessage { [weak self, weak conn] data, context, _, error in
             guard let self, let conn else { return }
             if let error {
                 DebugLog.line("[ws] receive error: \(error)")
                 conn.cancel()
                 return
             }
-            var opcode = "?"
-            if let meta = context?.protocolMetadata.first as? NWProtocolWebSocket.Metadata {
-                switch meta.opcode {
-                case .text: opcode = "text"
-                case .binary: opcode = "bin"
-                case .ping: opcode = "PING"
-                case .pong: opcode = "PONG"
-                case .close: opcode = "close"
-                @unknown default: opcode = "?"
-                }
-            }
-            DebugLog.line("[ws] recv opcode=\(opcode) len=\(data?.count ?? 0)")
             if let data, !data.isEmpty {
                 self.handleIncoming(data: data, context: context, on: conn)
             }
             if conn.state != .cancelled {
                 self.receive(on: conn)
             }
-            _ = isComplete
         }
     }
 
     private func handleIncoming(data: Data, context: NWConnection.ContentContext?, on conn: NWConnection) {
+        let connKey = ObjectIdentifier(conn)
         if let meta = context?.protocolMetadata.first as? NWProtocolWebSocket.Metadata {
             switch meta.opcode {
             case .text:
                 break
             case .binary:
-                // Bulk file payloads ride as binary WS frames now, not a
-                // separate raw-TCP channel. Reuses the OkHttp/NWConnection
-                // socket that we already know stays healthy end-to-end
-                // (WS PINGs keep flowing during long transfers, while a
-                // sibling raw TCP socket stalled for 30 s at a time on
-                // the same radio).
-                //
-                // Defense-in-depth: only honour binary frames on the
-                // authenticated socket. The text-message path already
-                // refuses non-HELLO traffic before HELLO completes; mirror
-                // that here so an unpaired peer can't even feed bytes into
-                // the FileTransferCenter / ProtocolFileClient correlation
-                // tables.
-                guard authedConnection === conn else {
-                    DebugLog.line("[ws] dropping binary frame from unauthed conn")
-                    return
-                }
-                handleBinaryFrame(data: data)
+                guard let session = sessionByConn[connKey] else { return }
+                handleBinaryFrame(data: data, from: session.deviceId)
                 return
             case .close:
                 conn.cancel()
@@ -268,106 +234,136 @@ final class WsServer: @unchecked Sendable {
             return
         }
 
-        if authedConnection !== conn {
-            switch message {
-            case let .hello(secret, deviceName, proto, features):
-                guard proto >= WireCodec.minAcceptedProtocol,
-                      proto <= WireCodec.protocolVersion else {
-                    sendError(on: conn, code: "bad_proto", msg: "unsupported proto \(proto)")
-                    queue.asyncAfter(deadline: .now() + 0.1) { conn.cancel() }
-                    return
-                }
-                guard Pairing.shared.verify(secret) else {
-                    sendError(on: conn, code: "bad_secret", msg: "auth failed")
-                    queue.asyncAfter(deadline: .now() + 0.1) { conn.cancel() }
-                    return
-                }
-                authedConnection = conn
-                peerFeatures = Set(features)
-                let peerHost = Self.extractHost(from: conn)
-                Task { @MainActor in
-                    AppState.shared.isClientConnected = true
-                    AppState.shared.pairedDeviceName = deviceName
-                    AppState.shared.peerFeatures = Set(features)
-                    AppState.shared.peerHost = peerHost
-                }
-                let ack = WireMessage.helloAck(
-                    accepted: true,
-                    serverName: Host.current().localizedName ?? "Mac",
-                    features: FeatureRegistry.supported,
-                    dataPort: 0  // retired; file bytes ride as WS binary frames
-                )
-                send(ack, on: conn)
-                // Ask the phone for its current media snapshot so the
-                // mini-player is populated right away.
-                if peerFeatures.contains("media") {
-                    send(.mediaCmd(cmd: "refresh", value: nil), on: conn)
-                }
-                // Push our muted-app snapshot so the two sides converge on
-                // (re)connect. The phone does the same from its side.
-                Task { @MainActor in
-                    WsServer.shared.send(.blocklist(packages: BlockedApps.shared.snapshot()))
-                }
-            default:
-                sendError(on: conn, code: "bad_secret", msg: "hello required first")
-                queue.asyncAfter(deadline: .now() + 0.1) { conn.cancel() }
-            }
+        guard let session = sessionByConn[connKey] else {
+            handleUnauthenticated(message: message, on: conn)
             return
         }
+        handleAuthenticated(message: message, session: session)
+    }
 
+    private func handleUnauthenticated(message: WireMessage, on conn: NWConnection) {
         switch message {
-        case .posted(let p):
+        case let .hello(secret, deviceName, proto, features, rawDeviceId):
+            guard proto >= WireCodec.minAcceptedProtocol,
+                  proto <= WireCodec.protocolVersion else {
+                sendError(on: conn, code: "bad_proto", msg: "unsupported proto \(proto)")
+                queue.asyncAfter(deadline: .now() + 0.1) { conn.cancel() }
+                return
+            }
+            guard Pairing.shared.verify(secret) else {
+                sendError(on: conn, code: "bad_secret", msg: "auth failed")
+                queue.asyncAfter(deadline: .now() + 0.1) { conn.cancel() }
+                return
+            }
+
+            let peerHost = Self.extractHost(from: conn)
+            let resolvedId: String
+            if let rawDeviceId, !rawDeviceId.isEmpty {
+                resolvedId = rawDeviceId
+            } else {
+                resolvedId = "\(deviceName)@\(peerHost ?? "lan")"
+            }
+
+            // If this exact phone already had an older socket, replace only it.
+            if let previous = sessionsByDeviceId[resolvedId], previous.conn !== conn {
+                sessionByConn.removeValue(forKey: ObjectIdentifier(previous.conn))
+                previous.conn.cancel()
+            }
+
+            let featureSet = Set(features)
+            let session = ClientSession(
+                deviceId: resolvedId,
+                deviceName: deviceName,
+                host: peerHost,
+                conn: conn,
+                features: featureSet
+            )
+            pendingConnections.removeValue(forKey: ObjectIdentifier(conn))
+            sessionsByDeviceId[resolvedId] = session
+            sessionByConn[ObjectIdentifier(conn)] = session
+            if defaultTargetDeviceId == nil {
+                defaultTargetDeviceId = resolvedId
+            }
+
+            Task { @MainActor in
+                AppState.shared.upsertDevice(
+                    id: resolvedId,
+                    name: deviceName,
+                    host: peerHost,
+                    features: featureSet
+                )
+            }
+
+            let ack = WireMessage.helloAck(
+                accepted: true,
+                serverName: Host.current().localizedName ?? "Mac",
+                features: FeatureRegistry.supported,
+                dataPort: Int(BulkTransferServer.shared.port)
+            )
+            send(ack, on: conn)
+
+            if featureSet.contains("media") {
+                send(.mediaCmd(cmd: "refresh", value: nil), on: conn)
+            }
+            Task { @MainActor in
+                WsServer.shared.send(.blocklist(packages: BlockedApps.shared.snapshot()), to: resolvedId)
+            }
+        default:
+            sendError(on: conn, code: "not_authed", msg: "send hello first")
+            queue.asyncAfter(deadline: .now() + 0.1) { conn.cancel() }
+        }
+    }
+
+    private func handleAuthenticated(message: WireMessage, session: ClientSession) {
+        let deviceId = session.deviceId
+        let deviceName = session.deviceName
+        switch message {
+        case let .posted(p):
             Task { @MainActor in
                 AppState.shared.incrementMirrored()
-                // End-to-end test correlator: if a `test_request` is in
-                // flight and this `posted` carries its nonce in the body
-                // (or title), clear the pending marker so the UI sees
-                // "round-trip succeeded" instead of "timed out".
-                if let pending = AppState.shared.pendingE2ETestReqId,
-                   ((p.text ?? "").contains(pending) || (p.title ?? "").contains(pending)) {
+                if let reqId = AppState.shared.pendingE2ETestReqId,
+                   (p.text?.contains(reqId) == true) || (p.title?.contains(reqId) == true) {
                     AppState.shared.pendingE2ETestReqId = nil
                 }
-                NotificationPresenter.shared.handlePosted(p)
+                NotificationPresenter.shared.handlePosted(p, from: deviceId, deviceName: deviceName)
             }
-        case .removed(let key):
+        case let .removed(key):
             Task { @MainActor in
                 NotificationPresenter.shared.handleRemoved(key: key)
             }
-        case let .clip(text, origin, seq):
-            Task { @MainActor in
-                ClipboardSync.shared.handleRemoteClip(text: text, origin: origin, seq: seq)
-            }
-        case .mediaState(let m):
-            Task { @MainActor in
-                MediaController.shared.handleRemoteState(m)
-            }
-        case .batteryState(let b):
-            Task { @MainActor in
-                BatteryStore.shared.handleRemoteState(b)
-            }
-        case .blocklist(let packages):
+        case let .blocklist(packages):
             Task { @MainActor in
                 BlockedApps.shared.applyRemote(packages)
             }
+        case let .clip(text, origin, seq):
+            if origin != "mac" {
+                Task { @MainActor in
+                    ClipboardSync.shared.handleRemoteClip(
+                        text: text, origin: origin, seq: seq, deviceName: deviceName
+                    )
+                }
+            }
+        case let .mediaState(m):
+            Task { @MainActor in
+                MediaController.shared.handleRemoteState(m, from: deviceId)
+            }
+        case let .batteryState(b):
+            Task { @MainActor in
+                BatteryStore.shared.handleRemoteState(b, from: deviceId, deviceName: deviceName)
+            }
         case let .fileOffer(offer):
             Task { @MainActor in
-                FileTransferCenter.shared.handleOffer(offer)
+                FileTransferCenter.shared.handleOffer(offer, from: deviceId, deviceName: deviceName)
             }
         case let .fileAccept(xid):
             Task { @MainActor in FileTransferCenter.shared.handleAccept(xid: xid) }
         case let .fileReject(xid, reason):
             Task { @MainActor in FileTransferCenter.shared.handleReject(xid: xid, reason: reason) }
         case let .fileChunk(xid, offset, data, last):
-            // Legacy WS chunk path — bytes now flow through the raw-TCP data
-            // channel. Kept here as a fallback for older peers that haven't
-            // picked up a dataPort yet; decode the base64 and hand off to the
-            // same binary handler.
-            Task { @MainActor in
-                let bytes = Data(base64Encoded: data) ?? Data()
-                FileTransferCenter.shared.handleBinaryChunk(
-                    xid: xid, offset: offset, bytes: bytes, last: last
-                )
-            }
+            let bytes = Data(base64Encoded: data) ?? Data()
+            FileTransferCenter.shared.handleBinaryChunk(
+                xid: xid, offset: offset, bytes: bytes, last: last
+            )
         case let .fileDone(xid):
             Task { @MainActor in FileTransferCenter.shared.handleDone(xid: xid) }
         case let .fileAck(xid, ok, err):
@@ -375,82 +371,100 @@ final class WsServer: @unchecked Sendable {
         case let .fileCancel(xid, reason):
             Task { @MainActor in FileTransferCenter.shared.handleCancel(xid: xid, reason: reason) }
         case .fsListResult, .fsOpResult, .fsDiskResult, .fsDuResult,
-             .fsReadResult, .fsWriteReady, .fsChunk:
-            // All "phone → Mac" browse responses route through the correlation
-            // table in ProtocolFileClient. `fs_chunk` going Mac → phone is only
-            // sent outbound; the inbound path here is for fs_read bodies.
+             .fsReadResult, .fsWriteReady, .fsChunk, .fsThumbResult:
             Task { @MainActor in ProtocolFileClient.shared.deliver(message) }
-        case .fsList, .fsDelete, .fsMkdir, .fsRename, .fsDisk, .fsDu, .fsRead, .fsWrite, .fsCancel:
-            // Requests are Mac → phone only. The phone shouldn't send them;
-            // drop silently rather than error-out in case a future peer mis-
-            // wires directions.
+        case .fsList, .fsDelete, .fsMkdir, .fsRename, .fsDisk, .fsDu, .fsRead, .fsWrite, .fsCancel, .fsThumb:
             NSLog("unexpected inbound browse request")
         case .ping:
-            send(.pong, on: conn)
+            send(.pong, on: session.conn)
         case .pong:
             break
-        case .error(let code, let msg):
-            NSLog("client error: \(code) \(msg)")
-        case .unknown(let t):
+        case let .error(code, msg):
+            NSLog("client error (\(deviceName)): \(code) \(msg)")
+        case let .unknown(t):
             NSLog("ignoring unknown message type: \(t)")
         default:
             break
         }
     }
 
-    func sendDismiss(key: String) {
-        send(.dismiss(key: key))
-    }
+    // MARK: - Outbound Routing
 
-    func sendAction(key: String, actionId: String, text: String?) {
-        send(.action(key: key, actionId: actionId, text: text))
-    }
-
-    /// Ask the phone to post a real notification from the NotifMirror app
-    /// package, so the NotificationListener picks it up and round-trips it
-    /// back as a normal `posted`. Caller correlates by `reqId`.
-    func sendTestRequest(reqId: String) {
-        send(.testRequest(reqId: reqId))
-    }
-
-    /// Generic send used by clipboard / media / file subsystems.
-    func send(_ message: WireMessage) {
+    func setDefaultTargetDevice(_ deviceId: String?) {
         queue.async { [weak self] in
-            guard let self, let conn = self.authedConnection else { return }
-            self.send(message, on: conn)
+            self?.defaultTargetDeviceId = deviceId
+        }
+    }
+
+    func sendDismiss(key: String, to deviceId: String? = nil) {
+        if let deviceId {
+            send(.dismiss(key: key), to: deviceId)
+        } else {
+            broadcast(.dismiss(key: key))
+        }
+    }
+
+    @discardableResult
+    func sendAction(key: String, actionId: String, text: String?, to deviceId: String? = nil) -> Bool {
+        guard isClientAuthed else { return false }
+        send(.action(key: key, actionId: actionId, text: text), to: deviceId)
+        return true
+    }
+
+    func sendTestRequest(reqId: String, to deviceId: String? = nil) {
+        send(.testRequest(reqId: reqId), to: deviceId)
+    }
+
+    /// Send to a specific device (or the currently active default phone when `deviceId == nil`).
+    func send(_ message: WireMessage, to deviceId: String? = nil) {
+        queue.async { [weak self] in
+            guard let self, let session = self.resolveSession(deviceId) else { return }
+            self.send(message, on: session.conn)
+        }
+    }
+
+    /// Broadcast to all connected phones (optionally filtered by an advertised feature).
+    func broadcast(_ message: WireMessage, requiringFeature feature: String? = nil) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            for session in self.sessionsByDeviceId.values {
+                if let feature, !session.features.contains(feature) { continue }
+                self.send(message, on: session.conn)
+            }
         }
     }
 
     var isClientAuthed: Bool {
-        // Reads are off-queue but authedConnection is only assigned from the
-        // queue. For UI purposes an occasional torn read is fine.
-        authedConnection != nil
+        !sessionsByDeviceId.isEmpty
     }
 
-    /// Cancel the listener and start a fresh one so a freshly-minted TLS
-    /// identity (after the pairing secret + cert are rotated) actually takes
-    /// effect — `NWProtocolTLS.Options` is bound at listener-creation time,
-    /// so the running listener would otherwise keep presenting the old cert.
+    func disconnectDevice(_ deviceId: String) {
+        queue.async { [weak self] in
+            guard let self, let session = self.sessionsByDeviceId[deviceId] else { return }
+            session.conn.cancel()
+        }
+    }
+
     func restartListener() {
+        BulkTransferServer.shared.restart()
         queue.async { [weak self] in
             guard let self else { return }
-            let oldConn = self.connection
-            self.connection = nil
-            self.authedConnection = nil
-            self.peerFeatures = []
-            oldConn?.cancel()
+            let allConns = Array(self.pendingConnections.values)
+                + self.sessionsByDeviceId.values.map(\.conn)
+            self.pendingConnections.removeAll()
+            self.sessionsByDeviceId.removeAll()
+            self.sessionByConn.removeAll()
+            self.defaultTargetDeviceId = nil
+            allConns.forEach { $0.cancel() }
             self.listener?.cancel()
             self.listener = nil
             Task { @MainActor in
-                AppState.shared.isClientConnected = false
-                AppState.shared.pairedDeviceName = nil
-                AppState.shared.peerHost = nil
-                AppState.shared.peerFeatures = []
+                AppState.shared.removeAllDevices()
                 AppState.shared.isServerListening = false
-                FileTransferCenter.shared.peerDisconnected()
-                MediaController.shared.peerDisconnected()
-                ProtocolFileClient.shared.peerDisconnected()
-                BatteryStore.shared.peerDisconnected()
+                FileTransferCenter.shared.peerDisconnected(deviceId: nil)
+                MediaController.shared.peerDisconnected(deviceId: nil)
+                ProtocolFileClient.shared.peerDisconnected(deviceId: nil)
+                BatteryStore.shared.peerDisconnected(deviceId: nil)
             }
             do {
                 try self.start()
@@ -463,64 +477,59 @@ final class WsServer: @unchecked Sendable {
         }
     }
 
-    /// Force-drops any live client. Used when the pairing secret is rotated —
-    /// the existing connection was authenticated with the old secret, so we
-    /// tear it down so the phone has to re-pair with the new QR.
     func disconnectActiveClient() {
         queue.async { [weak self] in
             guard let self else { return }
-            let conn = self.connection
-            self.connection = nil
-            self.authedConnection = nil
-            self.peerFeatures = []
-            conn?.cancel()
+            let allConns = Array(self.pendingConnections.values)
+                + self.sessionsByDeviceId.values.map(\.conn)
+            self.pendingConnections.removeAll()
+            self.sessionsByDeviceId.removeAll()
+            self.sessionByConn.removeAll()
+            self.defaultTargetDeviceId = nil
+            allConns.forEach { $0.cancel() }
             Task { @MainActor in
-                AppState.shared.isClientConnected = false
-                AppState.shared.pairedDeviceName = nil
-                AppState.shared.peerHost = nil
-                AppState.shared.peerFeatures = []
-                FileTransferCenter.shared.peerDisconnected()
-                MediaController.shared.peerDisconnected()
-                ProtocolFileClient.shared.peerDisconnected()
-                BatteryStore.shared.peerDisconnected()
+                AppState.shared.removeAllDevices()
+                FileTransferCenter.shared.peerDisconnected(deviceId: nil)
+                MediaController.shared.peerDisconnected(deviceId: nil)
+                ProtocolFileClient.shared.peerDisconnected(deviceId: nil)
+                BatteryStore.shared.peerDisconnected(deviceId: nil)
             }
         }
     }
 
-    // MARK: - Binary chunk framing
-    //
-    // Fixed 18-byte header followed by raw payload:
-    //   [0]     kind  (0x01 = file_chunk, 0x02 = fs_chunk)
-    //   [1..9]  id    (8 ASCII hex chars — xid / reqId)
-    //   [9..17] offset (uint64, big-endian)
-    //   [17]    flags (bit 0 = last)
-    //   [18..]  payload
-    //
-    // No length field is needed because each WebSocket message is already
-    // framed end-to-end; we read `data.count` once NW delivers it.
+    private func resolveSession(_ deviceId: String?) -> ClientSession? {
+        if let deviceId, let match = sessionsByDeviceId[deviceId] {
+            return match
+        }
+        if let def = defaultTargetDeviceId, let match = sessionsByDeviceId[def] {
+            return match
+        }
+        return sessionsByDeviceId.values.first
+    }
+
+    // MARK: - Legacy Binary Chunk Framing (fallback for non-httpbulk peers)
 
     static let chunkKindFile:      UInt8 = 0x01
     static let chunkKindFs:        UInt8 = 0x02
-    /// Heartbeat from phone — tiny WS binary frame sent every ~10 ms during
-    /// a bulk transfer to keep the phone's Wi-Fi radio out of power-save so
-    /// AP→phone ACKs aren't buffered to DTIM boundaries. Silently dropped
-    /// here — the point is just the radio keep-alive.
     static let chunkKindHeartbeat: UInt8 = 0xFE
 
-    /// Encode + send a binary chunk frame on the authenticated connection.
     func sendBinaryChunk(
-        kind: UInt8, id: String, offset: Int64, payload: Data, last: Bool
+        kind: UInt8,
+        id: String,
+        offset: Int64,
+        payload: Data,
+        last: Bool,
+        to deviceId: String? = nil,
+        completion: (@Sendable (Error?) -> Void)? = nil
     ) {
         guard let idBytes = id.data(using: .ascii), idBytes.count == 8 else {
             NSLog("sendBinaryChunk: bad id \(id)")
+            completion?(nil)
             return
         }
         var buf = Data(capacity: 18 + payload.count)
         buf.append(kind)
         buf.append(idBytes)
-        // Offset: 8 bytes big-endian, assembled by hand so we don't rely on
-        // `withUnsafeBytes` of a misaligned storage position (Swift asserts
-        // on unaligned loads in debug builds).
         let uo = UInt64(bitPattern: offset)
         for i in 0..<8 {
             buf.append(UInt8((uo >> ((7 - i) * 8)) & 0xFF))
@@ -529,32 +538,30 @@ final class WsServer: @unchecked Sendable {
         buf.append(payload)
 
         queue.async { [weak self] in
-            guard let self, let conn = self.authedConnection else { return }
+            guard let self, let session = self.resolveSession(deviceId) else {
+                completion?(nil)
+                return
+            }
             let meta = NWProtocolWebSocket.Metadata(opcode: .binary)
-            let context = NWConnection.ContentContext(
-                identifier: "bin", metadata: [meta]
-            )
-            conn.send(content: buf, contentContext: context, isComplete: true,
-                      completion: .contentProcessed { err in
+            let context = NWConnection.ContentContext(identifier: "bin", metadata: [meta])
+            session.conn.send(content: buf, contentContext: context, isComplete: true,
+                              completion: .contentProcessed { err in
                 if let err { NSLog("sendBinary err: \(err)") }
+                completion?(err)
             })
         }
     }
 
-    private func handleBinaryFrame(data: Data) {
+    private func handleBinaryFrame(data: Data, from deviceId: String) {
         guard let firstByte = data.first else { return }
-        if firstByte == Self.chunkKindHeartbeat { return }  // radio keep-alive
-        guard data.count >= 18 else {
-            NSLog("binary frame too short: \(data.count)")
-            return
-        }
+        if firstByte == Self.chunkKindHeartbeat { return }
+        guard data.count >= 18 else { return }
         let base = data.startIndex
         let kind = data[base]
         let flagsByte = data[base + 17]
         guard let id = String(data: data[(base + 1)..<(base + 9)], encoding: .ascii) else {
             return
         }
-        // Decode offset byte-by-byte to sidestep unaligned-load asserts.
         var offU: UInt64 = 0
         for i in 0..<8 {
             offU = (offU << 8) | UInt64(data[base + 9 + i])
@@ -567,19 +574,15 @@ final class WsServer: @unchecked Sendable {
 
         switch kind {
         case Self.chunkKindFile:
-            Task { @MainActor in
-                FileTransferCenter.shared.handleBinaryChunk(
-                    xid: id, offset: offset, bytes: payload, last: last
-                )
-            }
+            FileTransferCenter.shared.handleBinaryChunk(
+                xid: id, offset: offset, bytes: payload, last: last
+            )
         case Self.chunkKindFs:
-            Task { @MainActor in
-                ProtocolFileClient.shared.handleBinaryChunk(
-                    reqId: id, offset: offset, bytes: payload, last: last
-                )
-            }
+            ProtocolFileClient.shared.handleBinaryChunk(
+                reqId: id, offset: offset, bytes: payload, last: last, from: deviceId
+            )
         default:
-            NSLog("unknown binary frame kind: \(kind)")
+            break
         }
     }
 
@@ -602,9 +605,5 @@ final class WsServer: @unchecked Sendable {
 }
 
 enum FeatureRegistry {
-    /// Features this server *supports receiving*. `fsbrowse` is advertised so
-    /// the phone knows it can opt-in (the actual decision is phone-side — it
-    /// only sets `fsbrowse` in its `hello.features` when MANAGE_EXTERNAL_STORAGE
-    /// is granted).
-    static let supported: [String] = ["clip", "media", "file", "fsbrowse"]
+    static let supported: [String] = ["clip", "media", "file", "fsbrowse", "fsthumb", "httpbulk"]
 }

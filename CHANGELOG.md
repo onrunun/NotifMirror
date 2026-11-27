@@ -4,6 +4,22 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- High-throughput TLS HTTP/1.1 bulk file transfer plane (`BulkTransferServer` / `BulkTransferClient`) with WebSocket fallback.
+- Multi-device support: multiple paired Android devices can connect to the Mac concurrently and be switched in the UI.
+- macOS: Control Center menu bar popover with 2×2 quick tiles, live drag-and-drop file drop, one-click Pause Mirroring (presentation mode), quick text handoff, and inline 2FA code copy (`CodeExtractor`).
+- macOS: Redesigned grouped sidebar main window, single-sidebar Phone Files browser with photo/video thumbnail grid (`fs_thumb`), smart filters, recursive folder downloads, and Storage Analyzer.
+- Android: Dedicated Settings screen, streamlined Home handoff hub, native Android Photo Picker multi-photo sharing, and improved QR pairing camera experience.
+- `THIRD_PARTY_NOTICES.md` documenting third-party attributions.
+
+### Security
+- macOS: Sanitize incoming transfer filenames against path traversal and enforce inbox directory containment (with unit tests).
+- macOS & Android: Restrict file-based `DebugLog` strictly to debug builds in app-private cache directories with size caps instead of writing to `/tmp` or shared Downloads in release builds.
+- Android: Disable global `android:usesCleartextTraffic` (all connections use SPKI-pinned TLS) and remove unused `network_security_config.xml`.
+- Repo hygiene: Harden `githooks/pre-commit` against keystore property files, private keys, and unquoted Gradle/properties credentials.
+
 ## [1.1.2] - 2026-09-03
 
 ### Added

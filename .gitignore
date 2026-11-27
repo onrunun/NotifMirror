@@ -10,10 +10,13 @@
 .vscode/
 *.swp
 *.swo
-.zcode/
 
-# ---------- Claude ----------
+# ---------- AI / local design tooling ----------
 .claude/
+.impeccable/
+.zcode/
+PRODUCT.md
+DESIGN.md
 
 # ---------- Android / Gradle ----------
 # Gradle caches & build outputs
@@ -27,10 +30,14 @@ local.properties
 *.aab
 *.ap_
 *.dex
-# Keystores (secrets!)
+# Keystores & private keys (secrets!)
 *.jks
 *.keystore
 keystore.properties
+*.pem
+*.key
+*.p12
+*.pfx
 # Kotlin
 .kotlin/
 # Navigation

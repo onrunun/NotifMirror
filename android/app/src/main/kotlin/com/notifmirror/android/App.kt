@@ -4,10 +4,12 @@ import android.app.Application
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.os.Build
+import com.notifmirror.android.service.DebugLog
 
 class App : Application() {
     override fun onCreate() {
         super.onCreate()
+        DebugLog.init(this)
         createTransfersChannel()
         createDiagnosticsChannel()
     }

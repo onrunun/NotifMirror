@@ -40,6 +40,7 @@ interface WsClientCallbacks {
 class WsClient(
     private val secret: String,
     private val deviceName: String,
+    private val deviceId: String,
     private val features: List<String>,
     /// SHA-256 of the Mac server cert's SubjectPublicKeyInfo (base64),
     /// taken from the pairing QR. Pins the TLS handshake.
@@ -94,6 +95,9 @@ class WsClient(
     fun connect(host: String, port: Int) {
         val url = "wss://$host:$port"
         currentUrl = url
+        authed.set(false)
+        isConnected = false
+        socket.getAndSet(null)?.close(1000, "reconnecting")
         val request = Request.Builder().url(url).build()
         val ws = client.newWebSocket(request, listener)
         socket.set(ws)
@@ -158,6 +162,10 @@ class WsClient(
 
     private val listener = object : WebSocketListener() {
         override fun onOpen(webSocket: WebSocket, response: Response) {
+            if (socket.get() !== webSocket) {
+                webSocket.close(1000, "superseded")
+                return
+            }
             Log.i(TAG, "ws open")
             isConnected = true
             callbacks.onConnected()
@@ -165,16 +173,19 @@ class WsClient(
                 secret = secret,
                 deviceName = deviceName,
                 proto = PROTO_VERSION,
-                features = features
+                features = features,
+                deviceId = deviceId
             )
             webSocket.send(WireCodec.encode(hello))
         }
 
         override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+            if (socket.get() !== webSocket) return
             callbacks.onBinaryMessage(bytes.toByteArray())
         }
 
         override fun onMessage(webSocket: WebSocket, text: String) {
+            if (socket.get() !== webSocket) return
             val message = try { WireCodec.decode(text) } catch (e: Exception) {
                 Log.w(TAG, "decode error", e); return
             }
@@ -203,12 +214,14 @@ class WsClient(
                 is WireMessage.FsList,
                 is WireMessage.FsDelete,
                 is WireMessage.FsMkdir,
+                is WireMessage.FsRename,
                 is WireMessage.FsDisk,
                 is WireMessage.FsDu,
                 is WireMessage.FsRead,
                 is WireMessage.FsWrite,
                 is WireMessage.FsChunk,
-                is WireMessage.FsCancel -> callbacks.onFsMessage(message)
+                is WireMessage.FsCancel,
+                is WireMessage.FsThumb -> callbacks.onFsMessage(message)
                 is WireMessage.TestRequest -> callbacks.onTestRequest(message.reqId)
                 is WireMessage.Blocklist -> callbacks.onBlocklist(message.packages)
                 WireMessage.Ping -> webSocket.send(WireCodec.encode(WireMessage.Pong))
@@ -225,6 +238,7 @@ class WsClient(
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+            if (socket.get() !== webSocket) return
             Log.i(TAG, "ws closed $code $reason")
             isConnected = false
             authed.set(false)
@@ -232,6 +246,7 @@ class WsClient(
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+            if (socket.get() !== webSocket) return
             Log.w(TAG, "ws failure", t)
             isConnected = false
             authed.set(false)

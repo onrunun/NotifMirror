@@ -3,6 +3,9 @@ package com.notifmirror.android.data
 import android.content.Context
 import android.content.SharedPreferences
 import com.notifmirror.android.protocol.WireMessage
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -27,6 +30,12 @@ class BlockedApps private constructor(ctx: Context) {
      *  snapshot to the Mac. */
     var onChange: (() -> Unit)? = null
 
+    private val _seenFlow = MutableStateFlow(loadSeen())
+    val seenFlow: StateFlow<List<SeenApp>> = _seenFlow.asStateFlow()
+
+    private val _blockedFlow = MutableStateFlow(blockedSet())
+    val blockedFlow: StateFlow<Set<String>> = _blockedFlow.asStateFlow()
+
     /** Called every time a notification arrives. Records pkg→name and
      *  returns true if the user has muted this package. */
     @Synchronized
@@ -40,6 +49,7 @@ class BlockedApps private constructor(ctx: Context) {
             seen.add(SeenApp(pkg, name, now, 1L))
         }
         saveSeen(seen)
+        _seenFlow.value = seen
         return blockedSet().contains(pkg)
     }
 
@@ -50,6 +60,7 @@ class BlockedApps private constructor(ctx: Context) {
         val map = loadState().toMutableMap()
         map[pkg] = BlockState(pkg, blocked, System.currentTimeMillis())
         saveState(map)
+        _blockedFlow.value = map.values.filter { it.blocked }.map { it.pkg }.toSet()
         onChange?.invoke()
     }
 
@@ -66,7 +77,10 @@ class BlockedApps private constructor(ctx: Context) {
                 changed = true
             }
         }
-        if (changed) saveState(map)
+        if (changed) {
+            saveState(map)
+            _blockedFlow.value = map.values.filter { it.blocked }.map { it.pkg }.toSet()
+        }
         return changed
     }
 
@@ -95,6 +109,13 @@ class BlockedApps private constructor(ctx: Context) {
     @Synchronized
     fun clearSeen() {
         prefs.edit().remove(KEY_SEEN).apply()
+        _seenFlow.value = emptyList()
+    }
+
+    @Synchronized
+    fun restoreSeen(list: List<SeenApp>) {
+        saveSeen(list)
+        _seenFlow.value = list
     }
 
     private fun saveSeen(list: List<SeenApp>) {

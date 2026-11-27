@@ -11,7 +11,7 @@ struct ActionDescriptor: Codable, Hashable {
 }
 
 enum WireMessage {
-    case hello(secret: String, deviceName: String, proto: Int, features: [String])
+    case hello(secret: String, deviceName: String, proto: Int, features: [String], deviceId: String? = nil)
     case helloAck(accepted: Bool, serverName: String, features: [String], dataPort: Int)
     case posted(Posted)
     case removed(key: String)
@@ -56,6 +56,9 @@ enum WireMessage {
     /// The phone should stop streaming for this reqId so Wi-Fi isn't wasted
     /// on a transfer the Mac has already given up on. No response expected.
     case fsCancel(reqId: String, reason: String)
+    /// Mac → phone: request a small JPEG thumbnail for an image or video.
+    case fsThumb(reqId: String, path: String, maxDim: Int)
+    case fsThumbResult(reqId: String, data: String?, error: String?)
 
     /// Mac → phone: ask Android to post a real local notification from the
     /// NotifMirror app package, so its NotificationListener catches it and
@@ -166,11 +169,12 @@ enum WireCodec {
     static func encode(_ message: WireMessage) throws -> Data {
         var dict: [String: Any] = ["v": protocolVersion]
         switch message {
-        case let .hello(secret, deviceName, proto, features):
+        case let .hello(secret, deviceName, proto, features, deviceId):
             dict["t"] = "hello"
             dict["secret"] = secret
             dict["deviceName"] = deviceName
             dict["proto"] = proto
+            if let deviceId, !deviceId.isEmpty { dict["deviceId"] = deviceId }
             if !features.isEmpty { dict["features"] = features }
         case let .helloAck(accepted, serverName, features, dataPort):
             dict["t"] = "hello_ack"
@@ -325,6 +329,12 @@ enum WireCodec {
             dict["last"] = last
         case let .fsCancel(reqId, reason):
             dict["t"] = "fs_cancel"; dict["reqId"] = reqId; dict["reason"] = reason
+        case let .fsThumb(reqId, path, maxDim):
+            dict["t"] = "fs_thumb"; dict["reqId"] = reqId; dict["path"] = path; dict["maxDim"] = maxDim
+        case let .fsThumbResult(reqId, data, error):
+            dict["t"] = "fs_thumb_result"; dict["reqId"] = reqId
+            if let d = data { dict["data"] = d }
+            if let e = error { dict["error"] = e }
         case let .testRequest(reqId):
             dict["t"] = "test_request"; dict["reqId"] = reqId
         case let .blocklist(packages):
@@ -363,7 +373,14 @@ enum WireCodec {
                   let proto = dict["proto"] as? Int
             else { throw WireError.malformed("hello missing fields") }
             let features = (dict["features"] as? [String]) ?? []
-            return .hello(secret: secret, deviceName: deviceName, proto: proto, features: features)
+            let deviceId = dict["deviceId"] as? String
+            return .hello(
+                secret: secret,
+                deviceName: deviceName,
+                proto: proto,
+                features: features,
+                deviceId: deviceId
+            )
         case "hello_ack":
             let accepted = (dict["accepted"] as? Bool) ?? false
             let name = (dict["serverName"] as? String) ?? ""
@@ -589,6 +606,16 @@ enum WireCodec {
             guard let reqId = dict["reqId"] as? String
             else { throw WireError.malformed("fs_cancel missing reqId") }
             return .fsCancel(reqId: reqId, reason: (dict["reason"] as? String) ?? "abandoned")
+        case "fs_thumb":
+            guard let reqId = dict["reqId"] as? String,
+                  let path = dict["path"] as? String
+            else { throw WireError.malformed("fs_thumb missing fields") }
+            let maxDim = (dict["maxDim"] as? Int) ?? 240
+            return .fsThumb(reqId: reqId, path: path, maxDim: maxDim)
+        case "fs_thumb_result":
+            guard let reqId = dict["reqId"] as? String
+            else { throw WireError.malformed("fs_thumb_result missing reqId") }
+            return .fsThumbResult(reqId: reqId, data: dict["data"] as? String, error: dict["error"] as? String)
         case "test_request":
             guard let reqId = dict["reqId"] as? String
             else { throw WireError.malformed("test_request missing reqId") }

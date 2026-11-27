@@ -1,26 +1,33 @@
 # NotifMirror — Android ↔ macOS bridge
 
-[![CI](https://github.com/onrunun/notifmirror/actions/workflows/ci.yml/badge.svg)](https://github.com/onrunun/notifmirror/actions/workflows/ci.yml)
+[![CI](https://github.com/onrunun/NotifMirror/actions/workflows/ci.yml/badge.svg)](https://github.com/onrunun/NotifMirror/actions/workflows/ci.yml)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+[![Platforms](https://img.shields.io/badge/platforms-macOS%2014%2B%20%7C%20Android%208%2B-informational)](#prerequisites)
 
 See your Android notifications on your Mac, reply from your keyboard, sync
 your clipboard, control your media, and move files between both — all over
-local Wi-Fi. Single-user, LAN-only: no cloud relay, no accounts, no data
-leaving your network.
+local Wi-Fi. Local-LAN only: no cloud relay, no accounts, no telemetry, and
+no data leaving your network.
 
 ## Features
 
 | | |
 |---|---|
-| **Notifications on your Mac** | Every notification from your Android phone appears as a macOS banner — app icon, title, and body included. WhatsApp-style inline photos work too. |
-| **Reply from your Mac** | Hover a banner and hit **Reply** to answer a message with your keyboard. The reply is sent from your phone, so it shows up as sent from you. |
-| **Sync'd dismissal** | Swipe a banner away on the Mac and it disappears on your phone, and the other way around. |
-| **Clipboard sync** | Copy on the Mac, paste on the phone — and copy on the phone, paste on the Mac. Opt-in and off by default, since clipboards often hold passwords and 2FA codes. |
-| **Media controls** | Now-playing, album art, and play/pause/next/prev right in your Mac menu bar, driven by whatever's playing on your phone. |
-| **Send files, both ways** | Pick a file on the Mac → it lands in the phone's Downloads. Share a photo or PDF from Android → it lands in `~/Downloads` on the Mac. |
-| **Browse the phone's files** | A **Files** pane lists your phone's storage. Works over Wi-Fi (with Android's "All files" permission) or — usually faster — over adb. |
-| **Screen mirroring** *(optional, developer-only)* | A **Mirror screen** menu item shows your phone on the Mac via [scrcpy](https://github.com/Genymobile/scrcpy). Requires adb; see [setup](#optional-screen-mirroring-developer-only). |
+| **Notifications & 2FA codes on Mac** | Every notification from your Android phone appears as a macOS banner — app icon, title, body, and inline photos included. Verification / 2FA codes are automatically detected for one-click copy, and **Pause banners** silences popups during presentations while keeping history intact. |
+| **Reply from your Mac** | Reply directly from a macOS banner, menu bar popover, or notification history. Replies are sent from your phone so they appear natively from you. |
+| **Sync'd dismissal & mute list** | Dismiss a notification on either device to clear it on both, and keep your muted-app list synchronized between phone and Mac. |
+| **Clipboard sync** | Opt-in two-way clipboard mirroring (off by default since clipboards often hold passwords and 2FA codes), one-off text handoff, RAM-only session clip history, Quick Settings tile, and Android's text-selection **Send to Mac** action. |
+| **Media controls** | Now-playing metadata, album art, volume, and play/pause/next/prev right in your Mac menu bar. |
+| **Fast file transfers, both ways** | High-throughput TLS HTTP/1.1 streaming (with WebSocket fallback) between Mac and phone, drag-and-drop onto the Mac app, and Android Photo Picker / Share sheet integration. |
+| **Phone Files & Storage Analyzer** | Browse phone folders in list or thumbnail-grid view, download files or whole folders recursively, and inspect storage usage over Wi-Fi (with Android's "All files" permission) or `adb`. |
+| **Multi-device support** | Connect multiple paired Android devices simultaneously and switch between them from the Mac app. |
+| **Screen mirroring** *(optional, developer-only)* | Launch [scrcpy](https://github.com/Genymobile/scrcpy) directly from NotifMirror. Requires `adb`; see [setup](#optional-screen-mirroring-developer-only). |
 
 ## Quick start
+
+Prebuilt binaries (signed Android APK + macOS app bundle) are attached to each
+[GitHub Release](https://github.com/onrunun/NotifMirror/releases), or build
+and deploy both platforms directly from source:
 
 ```sh
 ./scripts/build-and-deploy.sh   # builds Android + Mac, installs both, opens the Mac app
@@ -101,11 +108,14 @@ Or open `mac/NotifMirror.xcodeproj` in Xcode and press ⌘R.
 
 On first launch NotifMirror will:
 
-1. Generate a random 256-bit pairing secret and store it in the login Keychain.
-2. Start listening on a random port and advertise `_andnotif._tcp` via Bonjour.
-3. Open the **Pair** window with a QR code containing host/port/secret/name.
+1. Generate a random 256-bit pairing secret and a self-signed RSA-2048 TLS certificate (stored in user-scoped app preferences).
+2. Start listening on a random TLS port and advertise `_andnotif._tcp` via Bonjour.
+3. Open the **Pair** window with a QR code containing host, port, secret, device name, and certificate SPKI fingerprint (`fp`).
 
-Menu-bar commands: show pairing QR, regenerate secret, quit.
+Everything runs from the menu bar popover (quick toggles, drag-and-drop file
+send, quick text handoff, recent notifications, media controls) and the main
+window (Overview, Notifications, File Transfers, Phone Files, Mirrored Apps,
+and Settings).
 
 ## Build & install the Android app
 
@@ -208,13 +218,16 @@ so it inherits your shell PATH, or move the binaries into `/opt/homebrew/bin`
 
 ## Security model
 
-- Notifications, clipboard text, and file bytes travel over a **plaintext
-  WebSocket** + a 256-bit shared secret sent in `hello`. The threat model is
-  a trusted personal LAN.
-- A passive sniffer on the same Wi-Fi can read notification content,
-  clipboard text, and file bytes in plaintext. If that matters, upgrade to
-  TLS with a self-signed cert whose SHA-256 fingerprint is embedded in the QR
-  payload (the protocol reserves a `fp` field).
+- Notifications, clipboard text, and file bytes travel over **TLS-encrypted**
+  connections (both the `wss://` control WebSocket and the `https://` bulk
+  transfer data plane use a self-signed RSA-2048 certificate on macOS,
+  SPKI-pinned on Android via the QR code's `fp` field) plus a 256-bit shared
+  secret checked in constant time. A passive sniffer on the same Wi-Fi cannot
+  read your notifications, clipboard, or files.
+- Treat the pairing QR code like a password — anyone who scans or photographs
+  it can connect on your LAN. Use **Regenerate pairing secret** in Settings to
+  rotate both the secret and TLS certificate at any time. See
+  [`SECURITY.md`](SECURITY.md) for the full threat model and local storage details.
 - **Clipboard Sync is opt-in** and off by default — enable it in the Mac
   menu bar when you're ready. Clipboards often hold passwords / 2FA codes.
 
@@ -234,9 +247,9 @@ so it inherits your shell PATH, or move the binaries into `/opt/homebrew/bin`
 
 ## Tooling versions used
 
-- Xcode 26 (tested against the 26.5 SDK).
-- Android Gradle Plugin 8.5.2, Kotlin 2.0.20, Compose BOM 2024.09.01.
-- OkHttp 4.12.0, ML Kit Barcode Scanning 17.3.0, CameraX 1.3.4.
+- Xcode 26 (tested against the macOS 26 SDK).
+- Android Gradle Plugin 8.7.2, `compileSdk` 35, Kotlin 2.0.20, Compose BOM 2024.09.01.
+- OkHttp 4.12.0, ML Kit Barcode Scanning 17.3.0, CameraX 1.4.1.
 
 ## Development
 
@@ -269,8 +282,13 @@ git push --follow-tags                   # CI drafts a GitHub Release with the A
 ```
 
 Releases are tagged `v<semver>`; see [`CHANGELOG.md`](CHANGELOG.md).
-Dependencies are updated automatically by Dependabot (weekly).
 
 ### Contributing
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`SECURITY.md`](SECURITY.md).
+
+## License & Acknowledgments
+
+Licensed under the [GNU General Public License v3.0](LICENSE).
+See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) for third-party code
+attributions.

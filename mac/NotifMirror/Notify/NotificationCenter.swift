@@ -15,7 +15,7 @@ final class NotificationPresenter {
         NSLog("NotificationPresenter started")
     }
 
-    func handlePosted(_ p: WireMessage.Posted) {
+    func handlePosted(_ p: WireMessage.Posted, from deviceId: String? = nil, deviceName: String? = nil) {
         Task { @MainActor in
             if p.silent && Preferences.shared.hideSilent {
                 NSLog("dropping silent notification from \(p.pkg)")
@@ -53,13 +53,22 @@ final class NotificationPresenter {
             )
             await registry.register(category: category)
 
+            let multiPhone = AppState.shared.devices.count > 1
+            let appLabel = (multiPhone && deviceName != nil) ? "\(p.app) • \(deviceName!)" : p.app
+
             let content = UNMutableNotificationContent()
             content.title = p.title?.nilIfEmpty ?? p.app
-            if let sub = p.subText, !sub.isEmpty { content.subtitle = sub }
-            else if (p.title?.isEmpty == false) { content.subtitle = p.app }
+            if let sub = p.subText, !sub.isEmpty {
+                content.subtitle = (multiPhone && deviceName != nil) ? "\(sub) • \(deviceName!)" : sub
+            } else if p.title?.isEmpty == false || multiPhone {
+                content.subtitle = appLabel
+            }
             content.body = p.text ?? ""
 
-            if let text = p.text, !text.isEmpty,
+            let isPaused = AppState.shared.isMirroringPaused
+
+            if !isPaused,
+               let text = p.text, !text.isEmpty,
                let code = CodeExtractor.shared.code(in: text) {
                 content.subtitle = "Code: \(code)"
                 let pb = NSPasteboard.general
@@ -67,7 +76,9 @@ final class NotificationPresenter {
                 pb.setString(code, forType: .string)
             }
             content.categoryIdentifier = categoryId
-            content.userInfo = ["notifKey": p.key, "pkg": p.pkg]
+            var info: [AnyHashable: Any] = ["notifKey": p.key, "pkg": p.pkg]
+            if let deviceId { info["deviceId"] = deviceId }
+            content.userInfo = info
             content.sound = .default
 
             // Cache and use app icon as a thumbnail when no picture.
@@ -85,7 +96,16 @@ final class NotificationPresenter {
                 attachmentPath = result.url.path
             }
 
-            NotificationHistory.shared.record(p, attachmentPath: attachmentPath)
+            NotificationHistory.shared.record(
+                p,
+                attachmentPath: attachmentPath,
+                deviceId: deviceId,
+                deviceName: deviceName
+            )
+
+            // Presentation / Pause Mirroring mode suppresses banners & sound
+            // while still capturing notifications quietly in history.
+            if isPaused { return }
 
             let request = UNNotificationRequest(
                 identifier: p.key,

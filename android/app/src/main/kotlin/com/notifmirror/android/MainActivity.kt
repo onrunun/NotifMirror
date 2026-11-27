@@ -18,13 +18,17 @@ import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import com.notifmirror.android.ui.FilterScreen
 import com.notifmirror.android.ui.HomeScreen
 import com.notifmirror.android.ui.PairingScreen
+import com.notifmirror.android.ui.SettingsScreen
 import com.notifmirror.android.ui.SetupScreen
+import com.notifmirror.android.ui.areAnimationsEnabled
 import com.notifmirror.android.ui.theme.NotifMirrorTheme
 
 class MainActivity : ComponentActivity() {
@@ -46,6 +50,8 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 private fun Root() {
+    val context = LocalContext.current
+    val animationsEnabled = remember(context) { areAnimationsEnabled(context) }
     var backStack by rememberSaveable { mutableStateOf(listOf(Screen.Home.ordinal)) }
 
     BackHandler(enabled = backStack.size > 1) {
@@ -58,21 +64,33 @@ private fun Root() {
         targetState = screen,
         label = "screen",
         transitionSpec = {
-            val forward = targetState.ordinal > initialState.ordinal
-            val dir = if (forward) 1 else -1
-            (slideInHorizontally(tween(280)) { w -> dir * w / 6 } + fadeIn(tween(220)))
-                .togetherWith(
-                    slideOutHorizontally(tween(280)) { w -> -dir * w / 6 } + fadeOut(tween(180))
-                )
+            if (!animationsEnabled) {
+                fadeIn(tween(0)).togetherWith(fadeOut(tween(0)))
+            } else {
+                val forward = targetState.ordinal > initialState.ordinal
+                val dir = if (forward) 1 else -1
+                (slideInHorizontally(tween(280)) { w -> dir * w / 6 } + fadeIn(tween(220)))
+                    .togetherWith(
+                        slideOutHorizontally(tween(280)) { w -> -dir * w / 6 } + fadeOut(tween(180))
+                    )
+            }
         }
     ) { current ->
         when (current) {
             Screen.Home -> HomeScreen(
                 onPair = { backStack = backStack + Screen.Pairing.ordinal },
+                onOpenFilter = { backStack = backStack + Screen.Filter.ordinal },
+                onOpenSettings = { backStack = backStack + Screen.Settings.ordinal }
+            )
+            Screen.Settings -> SettingsScreen(
+                onBack = { backStack = backStack.dropLast(1) },
+                onPair = { backStack = backStack + Screen.Pairing.ordinal },
                 onOpenFilter = { backStack = backStack + Screen.Filter.ordinal }
             )
             Screen.Pairing -> PairingScreen(
-                onDone = { backStack = backStack + Screen.Setup.ordinal },
+                // Replace Pairing with Setup so pressing Back returns cleanly to Home
+                // instead of dropping back into the camera after pairing is saved.
+                onDone = { backStack = backStack.dropLast(1) + Screen.Setup.ordinal },
                 onCancel = { backStack = backStack.dropLast(1) }
             )
             Screen.Setup -> SetupScreen(
@@ -84,4 +102,4 @@ private fun Root() {
     }
 }
 
-private enum class Screen { Home, Pairing, Setup, Filter }
+private enum class Screen { Home, Settings, Pairing, Setup, Filter }

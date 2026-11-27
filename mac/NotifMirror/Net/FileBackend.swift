@@ -76,39 +76,42 @@ struct AdbFileBackend: FileBackend {
 }
 
 struct ProtocolFileBackend: FileBackend {
+    let deviceId: String?
+
+    init(deviceId: String? = nil) {
+        self.deviceId = deviceId
+    }
+
     func list(path: String,
               onBatch: (@Sendable ([AdbEntry]) -> Void)?) async throws -> [AdbEntry] {
-        // Wi-Fi/fsbrowse returns one FsListResult atomically — no native
-        // streaming. `onBatch` is intentionally unused here; the caller
-        // still gets the full list on return.
-        try await ProtocolFileClient.shared.list(path: path)
+        try await ProtocolFileClient.shared.list(path: path, deviceId: deviceId)
     }
     func delete(path: String) async throws {
-        try await ProtocolFileClient.shared.delete(path: path)
+        try await ProtocolFileClient.shared.delete(path: path, deviceId: deviceId)
     }
     func mkdir(path: String) async throws {
-        try await ProtocolFileClient.shared.mkdir(path: path)
+        try await ProtocolFileClient.shared.mkdir(path: path, deviceId: deviceId)
     }
     func rename(from: String, to: String) async throws {
-        try await ProtocolFileClient.shared.rename(from: from, to: to)
+        try await ProtocolFileClient.shared.rename(from: from, to: to, deviceId: deviceId)
     }
     func diskUsage(path: String) async throws -> (free: Int64, total: Int64) {
-        try await ProtocolFileClient.shared.diskUsage(path: path)
+        try await ProtocolFileClient.shared.diskUsage(path: path, deviceId: deviceId)
     }
     func diskAnalyze(path: String) async throws -> DiskUsageReport {
-        try await ProtocolFileClient.shared.diskAnalyze(path: path)
+        try await ProtocolFileClient.shared.diskAnalyze(path: path, deviceId: deviceId)
     }
     func pull(remote: String, to local: URL,
               onProgress: (@Sendable (Double) -> Void)?) async throws {
         try await ProtocolFileClient.shared.pull(
-            remote: remote, to: local,
+            remote: remote, to: local, deviceId: deviceId,
             onProgress: onProgress.map { cb in { pct in cb(pct) } }
         )
     }
     func push(local: URL, to remote: String,
               onProgress: (@Sendable (Double) -> Void)?) async throws {
         try await ProtocolFileClient.shared.push(
-            local: local, to: remote,
+            local: local, to: remote, deviceId: deviceId,
             onProgress: onProgress.map { cb in { pct in cb(pct) } }
         )
     }

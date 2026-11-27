@@ -23,7 +23,8 @@ class WireCodecTest {
                 secret = "s3cr3t",
                 deviceName = "Pixel 8",
                 proto = 2,
-                features = listOf("clip", "media", "file")
+                features = listOf("clip", "media", "file", "httpbulk"),
+                deviceId = "a1b2c3d4e5f60718"
             )
         )
         assertTrue(m is WireMessage.Hello)
@@ -31,7 +32,8 @@ class WireCodecTest {
         assertEquals("s3cr3t", m.secret)
         assertEquals("Pixel 8", m.deviceName)
         assertEquals(2, m.proto)
-        assertEquals(listOf("clip", "media", "file"), m.features)
+        assertEquals(listOf("clip", "media", "file", "httpbulk"), m.features)
+        assertEquals("a1b2c3d4e5f60718", m.deviceId)
     }
 
     @Test
@@ -243,6 +245,15 @@ class WireCodecTest {
         assertTrue(roundTrip(WireMessage.FsWriteReady("r8", null)) is WireMessage.FsWriteReady)
         assertTrue(roundTrip(WireMessage.FsChunk("r8", 0, "aGk=", true)) is WireMessage.FsChunk)
         assertTrue(roundTrip(WireMessage.FsCancel("r9", "abandoned")) is WireMessage.FsCancel)
+        val thumbReq = roundTrip(WireMessage.FsThumb("r10", "/sdcard/DCIM/Camera/IMG_1.jpg", 240))
+        assertTrue(thumbReq is WireMessage.FsThumb)
+        assertEquals(240, (thumbReq as WireMessage.FsThumb).maxDim)
+        val thumbOk = roundTrip(WireMessage.FsThumbResult("r10", "/9j/4AAQ", null))
+        assertTrue(thumbOk is WireMessage.FsThumbResult)
+        assertEquals("/9j/4AAQ", (thumbOk as WireMessage.FsThumbResult).data)
+        val thumbErr = roundTrip(WireMessage.FsThumbResult("r11", null, "unsupported"))
+        assertTrue(thumbErr is WireMessage.FsThumbResult)
+        assertEquals("unsupported", (thumbErr as WireMessage.FsThumbResult).error)
     }
 
     @Test

@@ -124,7 +124,7 @@ final class BlockedApps: ObservableObject {
     }
 
     private func pushToPeer() {
-        WsServer.shared.send(.blocklist(packages: snapshot()))
+        WsServer.shared.broadcast(.blocklist(packages: snapshot()))
     }
 
     private func rebuildBlockedSet() {

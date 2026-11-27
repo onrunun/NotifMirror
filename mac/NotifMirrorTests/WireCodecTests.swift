@@ -12,20 +12,28 @@ final class WireCodecTests: XCTestCase {
     }
 
     func testHelloRoundTrip() throws {
-        let m = try roundTrip(.hello(secret: "s3cr3t", deviceName: "Pixel 8", proto: 2, features: ["clip", "media", "file"]))
-        guard case let .hello(secret, deviceName, proto, features) = m else {
+        let m = try roundTrip(.hello(
+            secret: "s3cr3t",
+            deviceName: "Pixel 8",
+            proto: 2,
+            features: ["clip", "media", "file", "httpbulk"],
+            deviceId: "a1b2c3d4e5f60718"
+        ))
+        guard case let .hello(secret, deviceName, proto, features, deviceId) = m else {
             return XCTFail("expected hello, got \(m)")
         }
         XCTAssertEqual(secret, "s3cr3t")
         XCTAssertEqual(deviceName, "Pixel 8")
         XCTAssertEqual(proto, 2)
-        XCTAssertEqual(features, ["clip", "media", "file"])
+        XCTAssertEqual(features, ["clip", "media", "file", "httpbulk"])
+        XCTAssertEqual(deviceId, "a1b2c3d4e5f60718")
     }
 
     func testHelloRoundTripEmptyFeatures() throws {
         let m = try roundTrip(.hello(secret: "k", deviceName: "d", proto: 1, features: []))
-        guard case let .hello(_, _, _, features) = m else { return XCTFail("expected hello") }
+        guard case let .hello(_, _, _, features, deviceId) = m else { return XCTFail("expected hello") }
         XCTAssertTrue(features.isEmpty)
+        XCTAssertNil(deviceId)
     }
 
     func testHelloAckRoundTrip() throws {
@@ -186,6 +194,15 @@ final class WireCodecTests: XCTestCase {
         guard case .fsWriteReady = try roundTrip(.fsWriteReady(reqId: "r8", error: nil)) else { return XCTFail("expected fsWriteReady") }
         guard case .fsChunk = try roundTrip(.fsChunk(reqId: "r8", offset: 0, data: "aGk=", last: true)) else { return XCTFail("expected fsChunk") }
         guard case .fsCancel = try roundTrip(.fsCancel(reqId: "r9", reason: "abandoned")) else { return XCTFail("expected fsCancel") }
+        let thumbReq = try roundTrip(.fsThumb(reqId: "r10", path: "/sdcard/DCIM/Camera/IMG_1.jpg", maxDim: 240))
+        guard case let .fsThumb(_, _, maxDim) = thumbReq else { return XCTFail("expected fsThumb") }
+        XCTAssertEqual(maxDim, 240)
+        let thumbOk = try roundTrip(.fsThumbResult(reqId: "r10", data: "/9j/4AAQ", error: nil))
+        guard case let .fsThumbResult(_, thumbData, _) = thumbOk else { return XCTFail("expected fsThumbResult") }
+        XCTAssertEqual(thumbData, "/9j/4AAQ")
+        let thumbErr = try roundTrip(.fsThumbResult(reqId: "r11", data: nil, error: "unsupported"))
+        guard case let .fsThumbResult(_, _, errMsg) = thumbErr else { return XCTFail("expected fsThumbResult error") }
+        XCTAssertEqual(errMsg, "unsupported")
     }
 
     func testTestRequestRoundTrip() throws {

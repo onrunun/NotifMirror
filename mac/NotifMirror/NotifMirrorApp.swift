@@ -38,7 +38,7 @@ struct NotifMirrorApp: App {
         MenuBarExtra {
             MenuContent()
                 .environmentObject(state)
-                .frame(width: 320)
+                .frame(width: 344)
         } label: {
             MenuBarLabel(state: state)
         }
@@ -63,8 +63,28 @@ private struct MenuBarLabel: View {
     @ObservedObject var state: AppState
     @Environment(\.openWindow) private var openWindow
 
+    private var symbolName: String {
+        if state.isMirroringPaused { return "bell.slash" }
+        return state.isClientConnected ? "bell.badge.fill" : "bell"
+    }
+
+    private var helpText: String {
+        if let pause = state.pauseLabel {
+            return "NotifMirror — \(pause)"
+        }
+        if state.devices.count > 1 {
+            return "NotifMirror — \(state.devices.count) phones connected"
+        }
+        if state.isClientConnected, let name = state.pairedDeviceName {
+            return "NotifMirror — Connected to \(name)"
+        }
+        return "NotifMirror — Waiting for phone"
+    }
+
     var body: some View {
-        Image(systemName: state.isClientConnected ? "bell.badge.fill" : "bell")
+        Image(systemName: symbolName)
+            .opacity(state.isMirroringPaused ? 0.6 : 1.0)
+            .help(helpText)
             .onChange(of: state.openMainWindowRequest) { _, token in
                 guard token != nil else { return }
                 openWindow(id: "main")
@@ -73,7 +93,7 @@ private struct MenuBarLabel: View {
             }
             .onChange(of: state.showPairingWindow) { _, shouldShow in
                 guard shouldShow else { return }
-                MainWindowSelection.shared.pending = .pairing
+                MainWindowSelection.shared.openPairing(isConnected: state.isClientConnected)
                 openWindow(id: "main")
                 NSApp.activate(ignoringOtherApps: true)
                 state.showPairingWindow = false
@@ -144,7 +164,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             _ = Pairing.shared.regenerateSecret()
             DispatchQueue.main.async {
                 NSApp.activate(ignoringOtherApps: true)
-                MainWindowSelection.shared.pending = .pairing
+                MainWindowSelection.shared.openPairing(isConnected: false)
                 AppState.shared.showPairingWindow = true
             }
         }
